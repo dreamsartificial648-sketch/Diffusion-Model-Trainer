@@ -1,0 +1,9 @@
+diffusers>=0.25.0
+transformers
+accelerate
+torch
+torchvision
+Pillow
+datasets
+huggingface_hub
+tensorboard
