@@ -338,9 +338,10 @@ class TrainTab(ttk.Frame):
             tooltip="Image size in pixels (e.g. 128 = 128x128). Higher uses more VRAM and is slower per step.",
         )
         self.batch_size = LabeledEntry(
-            settings, "Batch size", default=4,
+            settings, "Batch size", default=8,
             tooltip="Images processed per step. Higher uses more VRAM but trains faster per epoch. "
-                    "Lower this if you run out of memory.",
+                    "8 is a good starting point on a 12GB Ampere card (RTX 3060) at 128px; "
+                    "lower this if you run out of memory.",
         )
         self.learning_rate = LabeledEntry(
             settings, "Learning rate", default="1e-4",
@@ -351,16 +352,25 @@ class TrainTab(ttk.Frame):
             tooltip="fp16 speeds up training on most NVIDIA GPUs with little quality loss. "
                     "Use 'no' only if you hit numerical issues.",
         )
+        self.preview_every = LabeledEntry(
+            settings, "Preview every N epochs", default=5,
+            tooltip="How often to generate a preview image and save a checkpoint during "
+                    "training. Generating a preview re-runs the model's sampling process, "
+                    "which costs real time on top of training itself — previewing every "
+                    "epoch on a short run can roughly double total training time. "
+                    "Every 5-10 epochs gives plenty of visibility without the overhead.",
+        )
 
         self.epochs.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
         self.resolution.grid(row=0, column=1, sticky="ew", padx=6, pady=6)
         self.batch_size.grid(row=0, column=2, sticky="ew", padx=6, pady=6)
         self.learning_rate.grid(row=1, column=0, sticky="ew", padx=6, pady=6)
         self.mixed_precision.grid(row=1, column=1, sticky="ew", padx=6, pady=6)
+        self.preview_every.grid(row=1, column=2, sticky="ew", padx=6, pady=6)
 
         # Dataset folder picker
         data_row = ttk.Frame(settings, style="Panel.TFrame")
-        data_row.grid(row=1, column=2, sticky="ew", padx=6, pady=6)
+        data_row.grid(row=2, column=0, columnspan=3, sticky="ew", padx=6, pady=6)
         ttk.Label(data_row, text="Dataset folder", style="Field.TLabel").pack(anchor="w")
         picker_row = ttk.Frame(data_row, style="Panel.TFrame")
         picker_row.pack(fill="x", pady=(2, 0))
@@ -373,7 +383,7 @@ class TrainTab(ttk.Frame):
 
         # Model loading / output saving
         model_row = ttk.Frame(settings, style="Panel.TFrame")
-        model_row.grid(row=2, column=0, columnspan=3, sticky="ew", padx=6, pady=(8, 2))
+        model_row.grid(row=3, column=0, columnspan=3, sticky="ew", padx=6, pady=(8, 2))
         model_row.columnconfigure(1, weight=1)
         ttk.Label(model_row, text="Start from trained model", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.base_model_var = tk.StringVar(value="")
@@ -384,7 +394,7 @@ class TrainTab(ttk.Frame):
         Tooltip(base_entry, "Optional: pick an older trained DDPMPipeline folder to continue/fine-tune from. Leave blank to train from scratch.")
 
         out_row = ttk.Frame(settings, style="Panel.TFrame")
-        out_row.grid(row=3, column=0, columnspan=3, sticky="ew", padx=6, pady=(2, 6))
+        out_row.grid(row=4, column=0, columnspan=3, sticky="ew", padx=6, pady=(2, 6))
         out_row.columnconfigure(1, weight=1)
         ttk.Label(out_row, text="Save training to", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.output_dir_var = tk.StringVar(value=str(DEFAULT_OUTPUT_DIR))
@@ -570,6 +580,14 @@ class TrainTab(ttk.Frame):
             errors.append("Learning rate must be a number (e.g. 1e-4 or 0.0001).")
             lr = None
 
+        try:
+            preview_every = int(self.preview_every.get())
+            if preview_every <= 0:
+                errors.append("Preview every N epochs must be a positive whole number.")
+        except ValueError:
+            errors.append("Preview every N epochs must be a whole number (e.g. 5).")
+            preview_every = None
+
         data_dir = Path(self.data_dir_var.get())
         if not data_dir.exists():
             errors.append(f"Dataset folder does not exist: {data_dir}")
@@ -590,6 +608,7 @@ class TrainTab(ttk.Frame):
             "batch_size": batch_size,
             "learning_rate": lr,
             "mixed_precision": self.mixed_precision.get(),
+            "preview_every": preview_every,
             "data_dir": str(data_dir),
             "output_dir": str(output_dir),
             "base_model": base_model,
@@ -622,8 +641,9 @@ class TrainTab(ttk.Frame):
             "--num_epochs", str(settings["epochs"]),
             "--learning_rate", str(settings["learning_rate"]),
             "--mixed_precision", settings["mixed_precision"],
-            "--save_images_epochs", "1",
-            "--save_model_epochs", "1",
+            "--save_images_epochs", str(settings["preview_every"]),
+            "--save_model_epochs", str(settings["preview_every"]),
+            "--dataloader_num_workers", "4",
             "--stop_signal_file", str(self.stop_signal_file),
             "--gui_progress",
         ]

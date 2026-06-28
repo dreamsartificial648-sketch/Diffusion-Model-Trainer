@@ -206,6 +206,47 @@ def save_preview_grid(images, output_dir, epoch, gui_progress=False):
         emit_progress(gui_progress, event="preview_error", message=str(exc)[:300])
         return None
 
+def _identity(x):
+    """No-op transform (used in place of a lambda when random_flip is off).
+
+    Must be a real top-level function, not a lambda or closure: on Windows,
+    DataLoader workers are spawned as fresh processes and the whole transform
+    pipeline has to be pickled to hand off to them. Lambdas and local
+    functions can't be pickled, which breaks multi-worker loading on Windows
+    (it's silently fine on Linux/Mac, which use fork instead of spawn).
+    """
+    return x
+
+
+class ImageTransform:
+    """Picklable replacement for a closure-based transform function.
+
+    Same reasoning as _identity above: this used to be a function defined
+    inside main() that closed over `args`, `augmentations`, etc. That's
+    invisible on Linux (fork-based workers) but crashes immediately on
+    Windows with "Can't pickle local object" as soon as dataloader_num_workers
+    is set above 0. Storing the same state as attributes on a top-level class
+    instance keeps it picklable everywhere.
+    """
+
+    def __init__(self, augmentations, precision_augmentations, preserve_input_precision):
+        self.augmentations = augmentations
+        self.precision_augmentations = precision_augmentations
+        self.preserve_input_precision = preserve_input_precision
+
+    def __call__(self, examples):
+        processed = []
+        for image in examples["image"]:
+            if not self.preserve_input_precision:
+                processed.append(self.augmentations(image.convert("RGB")))
+            else:
+                precise_image = image
+                if precise_image.mode == "P":
+                    precise_image = precise_image.convert("RGB")
+                processed.append(self.precision_augmentations(precise_image))
+        return {"input": processed}
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train unconditional DDPM on your images.")
     parser.add_argument(
@@ -267,7 +308,15 @@ def parse_args():
         help="Batch size per device. 1 is safe for 6GB VRAM; 4 is a good starting point on 12GB Ampere cards.",
     )
     parser.add_argument("--eval_batch_size", type=int, default=4)
-    parser.add_argument("--dataloader_num_workers", type=int, default=0)
+    parser.add_argument(
+        "--dataloader_num_workers",
+        type=int,
+        default=4,
+        help="Background processes that load/augment images in parallel with GPU "
+        "training. 0 forces the main process to do this serially between every "
+        "step, which leaves the GPU idle waiting on the CPU. 2-4 is a good "
+        "default on a modern desktop CPU; lower if you see system stutter.",
+    )
     parser.add_argument("--num_epochs", type=int, default=100)
     parser.add_argument("--save_images_epochs", type=int, default=10)
     parser.add_argument("--save_model_epochs", type=int, default=10)
@@ -319,7 +368,21 @@ def parse_args():
         choices=["epsilon", "sample"],
     )
     parser.add_argument("--ddpm_num_steps", type=int, default=1000)
-    parser.add_argument("--ddpm_num_inference_steps", type=int, default=1000)
+    parser.add_argument(
+        "--ddpm_num_inference_steps",
+        type=int,
+        default=1000,
+        help="Denoising steps used for the FINAL saved model's quality. Leave high (e.g. 1000).",
+    )
+    parser.add_argument(
+        "--preview_num_inference_steps",
+        type=int,
+        default=100,
+        help="Denoising steps used only for in-training preview grids. Lower than "
+        "ddpm_num_inference_steps on purpose: previews just need to look "
+        "recognizable, not perfect, so we don't want to pay full sampling cost "
+        "every save_images_epochs during training. Final model is unaffected.",
+    )
     parser.add_argument("--ddpm_beta_schedule", type=str, default="linear")
     parser.add_argument("--checkpointing_steps", type=int, default=500)
     parser.add_argument("--checkpoints_total_limit", type=int, default=None)
@@ -545,7 +608,7 @@ def main(args):
     spatial_augmentations = [
         transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
         transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
-        transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
+        transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(_identity),
     ]
 
     augmentations = transforms.Compose(
@@ -566,17 +629,7 @@ def main(args):
         + [transforms.Normalize([0.5], [0.5])]
     )
 
-    def transform_images(examples):
-        processed = []
-        for image in examples["image"]:
-            if not args.preserve_input_precision:
-                processed.append(augmentations(image.convert("RGB")))
-            else:
-                precise_image = image
-                if precise_image.mode == "P":
-                    precise_image = precise_image.convert("RGB")
-                processed.append(precision_augmentations(precise_image))
-        return {"input": processed}
+    transform_images = ImageTransform(augmentations, precision_augmentations, args.preserve_input_precision)
 
     logger.info(f"Dataset size: {len(dataset)}")
     dataset.set_transform(transform_images)
@@ -586,6 +639,9 @@ def main(args):
         batch_size=args.train_batch_size,
         shuffle=True,
         num_workers=args.dataloader_num_workers,
+        persistent_workers=args.dataloader_num_workers > 0,
+        prefetch_factor=2 if args.dataloader_num_workers > 0 else None,
+        pin_memory=torch.cuda.is_available(),
     )
 
     lr_scheduler = get_scheduler(
@@ -658,6 +714,24 @@ def main(args):
 
     epoch_durations = []  # rolling history, used to smooth the ETA estimate
     stop_requested = False
+
+    def eta_reference_durations(durations):
+        """Durations to average for ETA purposes.
+
+        Epoch 0 includes one-time startup costs that never recur on later
+        epochs: CUDA kernel compilation, cuDNN algorithm benchmarking, pinned
+        memory buffer setup, and a cold OS file cache for the dataset. Left
+        in the average, epoch 0 alone can make the ETA look many times worse
+        than the run actually is (e.g. showing "2 hours remaining" early on,
+        for a run that settles into 35 minutes once warmed up).
+
+        Once we have at least one post-warmup epoch to use instead, drop
+        epoch 0 from the average. While still inside epoch 0 itself, there's
+        nothing else to go on yet, so use it anyway rather than show no ETA.
+        """
+        if len(durations) > 1:
+            return durations[1:]
+        return durations
 
     for epoch in range(first_epoch, args.num_epochs):
         epoch_start_time = time.time()
@@ -735,7 +809,8 @@ def main(args):
                     accelerator.log(logs, step=global_step)
 
                     if args.gui_progress and accelerator.is_main_process:
-                        avg_epoch_s = sum(epoch_durations) / len(epoch_durations) if epoch_durations else None
+                        eta_durations = eta_reference_durations(epoch_durations)
+                        avg_epoch_s = sum(eta_durations) / len(eta_durations) if eta_durations else None
                         epochs_remaining = args.num_epochs - epoch - 1
                         eta_seconds = None
                         if avg_epoch_s is not None:
@@ -761,7 +836,8 @@ def main(args):
         epoch_durations.append(epoch_duration)
 
         if args.gui_progress and accelerator.is_main_process:
-            avg_epoch_s = sum(epoch_durations) / len(epoch_durations)
+            eta_durations = eta_reference_durations(epoch_durations)
+            avg_epoch_s = sum(eta_durations) / len(eta_durations)
             epochs_remaining = args.num_epochs - epoch - 1
             emit_progress(
                 True,
@@ -784,7 +860,7 @@ def main(args):
                 images = pipeline(
                     generator=generator,
                     batch_size=args.eval_batch_size,
-                    num_inference_steps=args.ddpm_num_inference_steps,
+                    num_inference_steps=args.preview_num_inference_steps,
                     output_type="np",
                 ).images
 
