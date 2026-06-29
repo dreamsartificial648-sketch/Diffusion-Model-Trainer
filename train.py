@@ -160,8 +160,90 @@ def is_stop_requested(args):
     return bool(args.stop_signal_file and os.path.exists(args.stop_signal_file))
 
 
+def dir_size_bytes(path):
+    """Best-effort recursive folder size for progress messages."""
+    total = 0
+    path = Path(path)
+    if not path.exists():
+        return 0
+    for item in path.rglob("*"):
+        try:
+            if item.is_file():
+                total += item.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def format_bytes(num_bytes):
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(num_bytes)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+
+
+def cleanup_training_artifacts(output_dir, gui_progress=False, keep_latest_checkpoint=False):
+    """Delete heavy training-only artifacts while keeping the loadable pipeline.
+
+    The final Diffusers pipeline only needs model_index.json, scheduler/, and unet/.
+    Accelerate checkpoint-* folders can contain optimizer state, scheduler state,
+    RNG state, and EMA training weights, so they often become far larger than
+    the model itself. This cleanup is what keeps saved models in the MB/low-GB
+    range instead of exploding into dozens or hundreds of GB.
+    """
+    output_dir = Path(output_dir)
+    if not output_dir.exists():
+        return 0, []
+
+    removed_bytes = 0
+    removed_items = []
+
+    checkpoints = sorted(
+        [p for p in output_dir.iterdir() if p.is_dir() and p.name.startswith("checkpoint-")],
+        key=lambda p: int(p.name.split("-")[-1]) if p.name.split("-")[-1].isdigit() else -1,
+    )
+    if keep_latest_checkpoint and checkpoints:
+        checkpoints = checkpoints[:-1]
+
+    trash_targets = list(checkpoints)
+
+    # TensorBoard/W&B logs are useful while debugging, but not needed for generating.
+    # Keep GUI previews because they are tiny and useful to inspect model history.
+    for name in ["logs", "runs", "wandb", "gui_stop_training.flag"]:
+        p = output_dir / name
+        if p.exists():
+            trash_targets.append(p)
+
+    for target in trash_targets:
+        try:
+            size_before = dir_size_bytes(target) if target.is_dir() else target.stat().st_size
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+            removed_bytes += size_before
+            removed_items.append(target.name)
+        except OSError as exc:
+            logger.warning(f"Could not remove training artifact {target}: {exc}")
+
+    if removed_items:
+        emit_progress(
+            gui_progress,
+            event="storage_cleanup",
+            output_dir=str(output_dir),
+            removed_bytes=removed_bytes,
+            removed_human=format_bytes(removed_bytes),
+            removed_items=removed_items[:25],
+            final_size_bytes=dir_size_bytes(output_dir),
+            final_size_human=format_bytes(dir_size_bytes(output_dir)),
+        )
+    return removed_bytes, removed_items
+
+
 def save_pipeline_snapshot(accelerator, model, noise_scheduler, args, ema_model=None, epoch=None, stopped=False):
-    """Save a full DDPMPipeline that can be loaded by the Generate tab."""
+    """Save a lightweight DDPMPipeline that can be loaded by the Generate tab."""
     if not accelerator.is_main_process:
         return None
     unet = accelerator.unwrap_model(model)
@@ -169,15 +251,27 @@ def save_pipeline_snapshot(accelerator, model, noise_scheduler, args, ema_model=
         ema_model.store(unet.parameters())
         ema_model.copy_to(unet.parameters())
     pipeline = DDPMPipeline(unet=unet, scheduler=noise_scheduler)
-    pipeline.save_pretrained(args.output_dir)
+    pipeline.save_pretrained(args.output_dir, safe_serialization=True)
     if args.use_ema and ema_model is not None:
         ema_model.restore(unet.parameters())
+
+    if args.storage_saver:
+        cleanup_training_artifacts(
+            args.output_dir,
+            gui_progress=args.gui_progress,
+            keep_latest_checkpoint=args.keep_latest_resume_checkpoint,
+        )
+
+    final_size = dir_size_bytes(args.output_dir)
     emit_progress(
         args.gui_progress,
         event="model_saved",
         output_dir=args.output_dir,
         epoch=epoch,
         stopped=stopped,
+        size_bytes=final_size,
+        size_human=format_bytes(final_size),
+        storage_saver=args.storage_saver,
     )
     return pipeline
 
@@ -384,8 +478,30 @@ def parse_args():
         "every save_images_epochs during training. Final model is unaffected.",
     )
     parser.add_argument("--ddpm_beta_schedule", type=str, default="linear")
-    parser.add_argument("--checkpointing_steps", type=int, default=500)
-    parser.add_argument("--checkpoints_total_limit", type=int, default=None)
+    parser.add_argument(
+        "--checkpointing_steps",
+        type=int,
+        default=0,
+        help="Save heavy Accelerate resume checkpoints every N optimizer steps. 0 disables them. "
+        "The final Generate-ready model is still saved by --save_model_epochs.",
+    )
+    parser.add_argument(
+        "--checkpoints_total_limit",
+        type=int,
+        default=1,
+        help="Maximum number of heavy checkpoint-* resume folders to keep when checkpointing is enabled.",
+    )
+    parser.add_argument(
+        "--storage_saver",
+        type=lambda x: x.lower() != "false",
+        default=True,
+        help="Delete training-only artifacts after saving the loadable DDPM pipeline. Default: true.",
+    )
+    parser.add_argument(
+        "--keep_latest_resume_checkpoint",
+        action="store_true",
+        help="With --storage_saver, keep the newest checkpoint-* folder for exact resume. Off by default for smallest models.",
+    )
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--enable_xformers_memory_efficient_attention", action="store_true")
     parser.add_argument("--preserve_input_precision", action="store_true")
@@ -485,6 +601,13 @@ def main(args):
 
     if accelerator.is_main_process and args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
+        if args.storage_saver and not args.resume_from_checkpoint:
+            # Clear old bulky training folders from a previous run in this same output directory.
+            cleanup_training_artifacts(
+                args.output_dir,
+                gui_progress=args.gui_progress,
+                keep_latest_checkpoint=args.keep_latest_resume_checkpoint,
+            )
 
     if args.push_to_hub and accelerator.is_main_process:
         repo_id = create_repo(
@@ -788,11 +911,16 @@ def main(args):
                     progress_bar.update(1)
                     global_step += 1
 
-                    if accelerator.is_main_process and global_step % args.checkpointing_steps == 0:
+                    if (
+                        accelerator.is_main_process
+                        and args.checkpointing_steps
+                        and args.checkpointing_steps > 0
+                        and global_step % args.checkpointing_steps == 0
+                    ):
                         if args.checkpoints_total_limit is not None:
                             checkpoints = sorted(
                                 [d for d in os.listdir(args.output_dir) if d.startswith("checkpoint")],
-                                key=lambda x: int(x.split("-")[1]),
+                                key=lambda x: int(x.split("-")[1]) if x.split("-")[1].isdigit() else -1,
                             )
                             if len(checkpoints) >= args.checkpoints_total_limit:
                                 for cp in checkpoints[: len(checkpoints) - args.checkpoints_total_limit + 1]:
@@ -800,7 +928,7 @@ def main(args):
 
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
-                        logger.info(f"Saved checkpoint to {save_path}")
+                        logger.info(f"Saved resume checkpoint to {save_path}")
 
                     logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
                     if args.use_ema:
@@ -891,6 +1019,12 @@ def main(args):
         return
 
     accelerator.end_training()
+    if args.storage_saver and accelerator.is_main_process:
+        cleanup_training_artifacts(
+            args.output_dir,
+            gui_progress=args.gui_progress,
+            keep_latest_checkpoint=args.keep_latest_resume_checkpoint,
+        )
     emit_progress(args.gui_progress and accelerator.is_main_process, event="done", output_dir=args.output_dir)
 
 

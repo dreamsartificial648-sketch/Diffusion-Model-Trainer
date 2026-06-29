@@ -263,6 +263,221 @@ def generate_image(model_path_or_name: str, seed=None):
     return generate_images(model_path_or_name, seed=seed, num_inference_steps=50, batch_size=1)[0]
 
 
+def _get_model_sample_size(unet):
+    sample_size = getattr(unet.config, "sample_size", 128)
+    if isinstance(sample_size, (list, tuple)) and len(sample_size) >= 2:
+        return int(sample_size[0]), int(sample_size[1])
+    return int(sample_size), int(sample_size)
+
+
+def _normalize_noise_tensor(noise):
+    import torch
+    flat = noise.view(noise.shape[0], -1)
+    denom = flat.norm(dim=1, keepdim=True).clamp_min(1e-8)
+    flat = flat / denom
+    return flat.view_as(noise)
+
+
+def _pil_to_model_tensor(image, size, device, dtype):
+    import numpy as np
+    import torch
+    from PIL import Image as PILImage
+
+    if isinstance(size, int):
+        width = height = size
+    else:
+        width, height = size
+    image = image.convert("RGB").resize((width, height), PILImage.BILINEAR)
+    arr = np.asarray(image).astype("float32") / 255.0
+    tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+    tensor = tensor * 2.0 - 1.0
+    return tensor.to(device=device, dtype=dtype)
+
+
+def _model_tensor_to_pil(image_tensor):
+    import numpy as np
+    from PIL import Image as PILImage
+
+    image = (image_tensor / 2 + 0.5).clamp(0, 1)
+    image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
+    image = (image[0] * 255).round().astype("uint8")
+    return PILImage.fromarray(image)
+
+
+def _sample_with_pipeline_from_noise(pipeline, initial_noise, num_inference_steps=50):
+    image = initial_noise.clone()
+    scheduler = pipeline.scheduler
+    scheduler.set_timesteps(int(num_inference_steps))
+    for t in scheduler.timesteps:
+        model_output = pipeline.unet(image, t).sample
+        image = scheduler.step(model_output, t, image).prev_sample
+    return image
+
+
+def _sample_with_pipeline_from_reference(pipeline, reference_image, initial_noise, num_inference_steps=50, reference_influence=0.6):
+    import torch
+
+    device = next(pipeline.unet.parameters()).device
+    dtype = next(pipeline.unet.parameters()).dtype
+    sample_w, sample_h = _get_model_sample_size(pipeline.unet)
+    reference_tensor = _pil_to_model_tensor(reference_image, (sample_w, sample_h), device, dtype)
+
+    scheduler = pipeline.scheduler
+    scheduler.set_timesteps(int(num_inference_steps))
+    timesteps = scheduler.timesteps
+    if len(timesteps) == 0:
+        raise RuntimeError("Scheduler produced no timesteps.")
+
+    # Higher reference influence means we start closer to the clean reference image
+    # (less added noise, more preserved structure).
+    influence = max(0.0, min(1.0, float(reference_influence)))
+    start_index = int(round(influence * max(0, len(timesteps) - 1)))
+    start_index = max(0, min(start_index, len(timesteps) - 1))
+    start_t = timesteps[start_index]
+
+    if not isinstance(start_t, torch.Tensor):
+        start_t_tensor = torch.tensor([int(start_t)], device=device, dtype=torch.long)
+    else:
+        start_t_tensor = start_t.reshape(1).to(device=device, dtype=torch.long)
+
+    image = scheduler.add_noise(reference_tensor, initial_noise, start_t_tensor)
+    for t in timesteps[start_index:]:
+        model_output = pipeline.unet(image, t).sample
+        image = scheduler.step(model_output, t, image).prev_sample
+    return image
+
+
+def sample_reference_video_frames(video_path, target_frames):
+    import imageio.v2 as imageio
+    from PIL import Image as PILImage
+
+    if target_frames <= 0:
+        return []
+
+    reader = imageio.get_reader(str(video_path))
+    frames = []
+    try:
+        try:
+            length = reader.count_frames()
+        except Exception:
+            length = reader.get_length()
+
+        if length is None or length <= 0 or length == float("inf"):
+            cached = []
+            for frame in reader:
+                cached.append(frame)
+                if len(cached) >= max(target_frames, 1):
+                    break
+            if not cached:
+                return []
+            if len(cached) >= target_frames:
+                indices = [round(i * (len(cached) - 1) / max(1, target_frames - 1)) for i in range(target_frames)]
+                return [PILImage.fromarray(cached[idx]).convert("RGB") for idx in indices]
+            while len(cached) < target_frames:
+                cached.append(cached[-1])
+            return [PILImage.fromarray(frame).convert("RGB") for frame in cached[:target_frames]]
+
+        indices = [round(i * (length - 1) / max(1, target_frames - 1)) for i in range(target_frames)]
+        for idx in indices:
+            frame = reader.get_data(int(idx))
+            frames.append(PILImage.fromarray(frame).convert("RGB"))
+        return frames
+    finally:
+        try:
+            reader.close()
+        except Exception:
+            pass
+
+
+def generate_video_frames(
+    model_path_or_name: str,
+    seconds=4.0,
+    fps=24,
+    seed=None,
+    num_inference_steps=60,
+    smoothness=85,
+    reference_video_path=None,
+    reference_influence=0.6,
+    progress_callback=None,
+):
+    import torch
+
+    pipeline = load_pipeline(model_path_or_name)
+    device = next(pipeline.unet.parameters()).device
+    dtype = next(pipeline.unet.parameters()).dtype
+    sample_w, sample_h = _get_model_sample_size(pipeline.unet)
+
+    total_frames = max(1, int(round(float(seconds) * float(fps))))
+    base_seed = int(seed) if seed is not None else random.randint(0, 2_147_483_647)
+    generator = torch.Generator(device=device).manual_seed(base_seed)
+
+    current_noise = torch.randn((1, 3, sample_h, sample_w), generator=generator, device=device, dtype=dtype)
+    current_noise = _normalize_noise_tensor(current_noise)
+
+    # High smoothness = slower drift in latent space, lower smoothness = more change per frame.
+    smoothness = max(1, min(100, int(smoothness)))
+    drift_alpha = max(0.03, 1.0 - (smoothness / 100.0) * 0.95)
+
+    reference_frames = None
+    if reference_video_path:
+        reference_frames = sample_reference_video_frames(reference_video_path, total_frames)
+        if not reference_frames:
+            raise RuntimeError("Could not read frames from the reference video.")
+
+    frames = []
+    for frame_index in range(total_frames):
+        if frame_index > 0:
+            fresh_noise = torch.randn(current_noise.shape, generator=generator, device=device, dtype=dtype)
+            current_noise = _normalize_noise_tensor((1.0 - drift_alpha) * current_noise + drift_alpha * fresh_noise)
+
+        if reference_frames:
+            frame_tensor = _sample_with_pipeline_from_reference(
+                pipeline,
+                reference_frames[min(frame_index, len(reference_frames) - 1)],
+                current_noise,
+                num_inference_steps=num_inference_steps,
+                reference_influence=reference_influence,
+            )
+        else:
+            frame_tensor = _sample_with_pipeline_from_noise(
+                pipeline,
+                current_noise,
+                num_inference_steps=num_inference_steps,
+            )
+
+        frame_image = _model_tensor_to_pil(frame_tensor)
+        frames.append(frame_image)
+
+        if progress_callback is not None:
+            progress_callback(frame_index + 1, total_frames, frame_image)
+
+    return frames
+
+
+def save_video_frames(frames, output_path, fps=24):
+    import numpy as np
+    import imageio.v2 as imageio
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    arrays = [np.asarray(frame.convert("RGB")) for frame in frames]
+
+    if output_path.suffix.lower() == ".gif":
+        imageio.mimsave(str(output_path), arrays, fps=fps, loop=0)
+        return str(output_path)
+
+    try:
+        writer = imageio.get_writer(str(output_path), fps=fps)
+        for arr in arrays:
+            writer.append_data(arr)
+        writer.close()
+        return str(output_path)
+    except Exception:
+        fallback = output_path.with_suffix('.gif')
+        imageio.mimsave(str(fallback), arrays, fps=fps, loop=0)
+        return str(fallback)
+
+
 def scale_for_display(image, target_size=512):
     """Resize a generated image to a comfortably viewable size for the GUI.
 
@@ -464,7 +679,7 @@ class TrainTab(ttk.Frame):
             tooltip="Image size in pixels (e.g. 128 = 128x128). Higher uses more VRAM and is slower per step.",
         )
         self.batch_size = LabeledEntry(
-            settings, "Batch size", default=8,
+            settings, "Batch size", default=12,
             tooltip="Images processed per step. Higher uses more VRAM but trains faster per epoch. "
                     "8 is a good starting point on a 12GB Ampere card (RTX 3060) at 128px; "
                     "lower this if you run out of memory.",
@@ -479,7 +694,7 @@ class TrainTab(ttk.Frame):
                     "Use 'no' only if you hit numerical issues.",
         )
         self.preview_every = LabeledEntry(
-            settings, "Preview every N epochs", default=5,
+            settings, "Preview every N epochs", default=20,
             tooltip="How often to generate a preview image and save a checkpoint during "
                     "training. Generating a preview re-runs the model's sampling process, "
                     "which costs real time on top of training itself — previewing every "
@@ -538,6 +753,18 @@ class TrainTab(ttk.Frame):
             variable=self.use_ema_var, style="Dark.TCheckbutton",
         )
         ema_check.pack(side="left")
+
+        self.storage_saver_var = tk.BooleanVar(value=True)
+        storage_check = ttk.Checkbutton(
+            adv_row, text="Storage Saver (small final model)",
+            variable=self.storage_saver_var, style="Dark.TCheckbutton",
+        )
+        storage_check.pack(side="left", padx=(16, 0))
+        Tooltip(
+            storage_check,
+            "Recommended. Saves only the Generate-ready DDPM pipeline and removes heavy "
+            "checkpoint/log training artifacts that can turn one model into 100+ GB.",
+        )
 
         # Start/stop controls
         control_row = ttk.Frame(self, style="Panel.TFrame")
@@ -750,6 +977,7 @@ class TrainTab(ttk.Frame):
             "output_dir": str(output_dir),
             "base_model": base_model,
             "use_ema": self.use_ema_var.get(),
+            "storage_saver": self.storage_saver_var.get(),
         }, []
 
     # -- Process control --------------------------------------------------
@@ -784,6 +1012,20 @@ class TrainTab(ttk.Frame):
             "--stop_signal_file", str(self.stop_signal_file),
             "--gui_progress",
         ]
+        if settings["storage_saver"]:
+            cmd.extend([
+                "--storage_saver", "true",
+                "--checkpointing_steps", "0",
+                "--checkpoints_total_limit", "0",
+            ])
+        else:
+            # Advanced/experimental: keep only a tiny number of exact-resume checkpoints.
+            # This can still consume multiple GB, but it will not grow forever.
+            cmd.extend([
+                "--storage_saver", "false",
+                "--checkpointing_steps", "1000",
+                "--checkpoints_total_limit", "2",
+            ])
         if settings["base_model"]:
             cmd.extend(["--pretrained_model_path", settings["base_model"]])
         if settings["use_ema"]:
@@ -899,12 +1141,20 @@ class TrainTab(ttk.Frame):
             path = evt.get("path")
             if path:
                 self._show_preview_image(path, caption=f"Generated preview - epoch {evt.get('epoch')}")
+        elif kind == "storage_cleanup":
+            removed = evt.get("removed_human", "0 B")
+            final_size = evt.get("final_size_human", "?")
+            self._append_log(f"Storage Saver removed {removed} of training-only files. Current folder size: {final_size}.")
         elif kind == "model_saved":
             out = evt.get("output_dir")
             if out:
                 self.last_saved_model_dir = out
                 self.save_btn.config(state=tk.NORMAL)
-                self._append_log(f"Saved loadable model to: {out}")
+                size = evt.get("size_human")
+                if size:
+                    self._append_log(f"Saved lightweight loadable model to: {out}  ({size})")
+                else:
+                    self._append_log(f"Saved loadable model to: {out}")
         elif kind == "stopped":
             self.status_label.config(text="Training stopped and saved.")
             self.eta_label.config(text="Stopped")
@@ -1304,6 +1554,302 @@ class GenerateTab(ttk.Frame):
 
 
 # ----------------------------------------------------------------------------
+# Video tab
+# ----------------------------------------------------------------------------
+class VideoTab(ttk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, style="Panel.TFrame")
+        self.app = app
+        self.video_photo_ref = None
+        self.last_video_path = None
+        self._model_paths_by_label = {}
+        self._build_ui()
+        self.refresh_models()
+
+    def _build_ui(self):
+        self.columnconfigure(0, weight=0)
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        header = ttk.Label(self, text="Dream Video Generator", style="Heading.TLabel")
+        header.grid(row=0, column=0, columnspan=2, sticky="w", padx=16, pady=(16, 8))
+
+        controls = ttk.Frame(self, style="Card.TFrame")
+        controls.grid(row=1, column=0, sticky="ns", padx=(16, 10), pady=(0, 16))
+        preview = ttk.Frame(self, style="Card.TFrame")
+        preview.grid(row=1, column=1, sticky="nsew", padx=(0, 16), pady=(0, 16))
+        preview.columnconfigure(0, weight=1)
+        preview.rowconfigure(2, weight=1)
+
+        ttk.Label(controls, text="Video Controls", style="Meta.TLabel").pack(anchor="w", padx=12, pady=(12, 8))
+
+        model_wrap = ttk.Frame(controls, style="Card.TFrame")
+        model_wrap.pack(fill="x", padx=12, pady=6)
+        ttk.Label(model_wrap, text="Model", style="Meta.TLabel").pack(anchor="w")
+        self.video_model_var = tk.StringVar()
+        self.video_model_combo = ttk.Combobox(model_wrap, textvariable=self.video_model_var, state="readonly", width=28)
+        self.video_model_combo.pack(fill="x", pady=(2, 4))
+        buttons = ttk.Frame(model_wrap, style="Card.TFrame")
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Refresh", command=self.refresh_models, style="Secondary.TButton").pack(side="left")
+        ttk.Button(buttons, text="Use Generate Selection", command=self._use_generate_model, style="Secondary.TButton").pack(side="left", padx=(6, 0))
+
+        ref_wrap = ttk.Frame(controls, style="Card.TFrame")
+        ref_wrap.pack(fill="x", padx=12, pady=6)
+        ttk.Label(ref_wrap, text="Reference video (optional)", style="Meta.TLabel").pack(anchor="w")
+        self.reference_video_var = tk.StringVar(value="")
+        ttk.Entry(ref_wrap, textvariable=self.reference_video_var, style="Field.TEntry").pack(fill="x", pady=(2, 4))
+        ref_btns = ttk.Frame(ref_wrap, style="Card.TFrame")
+        ref_btns.pack(fill="x")
+        ttk.Button(ref_btns, text="Browse...", command=self._browse_reference_video, style="Secondary.TButton").pack(side="left")
+        ttk.Button(ref_btns, text="Clear", command=lambda: self.reference_video_var.set(""), style="Secondary.TButton").pack(side="left", padx=(6, 0))
+
+        length_wrap = ttk.Frame(controls, style="Card.TFrame")
+        length_wrap.pack(fill="x", padx=12, pady=6)
+        ttk.Label(length_wrap, text="Length / timing", style="Meta.TLabel").pack(anchor="w")
+        row = ttk.Frame(length_wrap, style="Card.TFrame")
+        row.pack(fill="x", pady=(2, 0))
+        self.seconds_var = tk.StringVar(value="4")
+        self.fps_var = tk.StringVar(value="24")
+        ttk.Label(row, text="Seconds", style="Meta.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Entry(row, textvariable=self.seconds_var, width=8, style="Field.TEntry").grid(row=1, column=0, sticky="w", padx=(0, 10))
+        ttk.Label(row, text="FPS", style="Meta.TLabel").grid(row=0, column=1, sticky="w")
+        ttk.Entry(row, textvariable=self.fps_var, width=8, style="Field.TEntry").grid(row=1, column=1, sticky="w")
+
+        self.video_steps = LabeledScale(
+            controls, "Inference steps", from_=10, to=120, default=60,
+            tooltip="More denoising steps usually gives cleaner frames, but each frame takes longer."
+        )
+        self.video_steps.pack(fill="x", padx=12, pady=6)
+
+        self.video_smoothness = LabeledScale(
+            controls, "Motion smoothness", from_=1, to=100, default=85,
+            tooltip="Higher values keep frames closer together in latent space for a smoother dream walk."
+        )
+        self.video_smoothness.pack(fill="x", padx=12, pady=6)
+
+        self.reference_influence = LabeledScale(
+            controls, "Reference influence", from_=0, to=100, default=60,
+            tooltip="How strongly the reference video frame structure is preserved. 0 ignores the reference video."
+        )
+        self.reference_influence.pack(fill="x", padx=12, pady=6)
+
+        seed_wrap = ttk.Frame(controls, style="Card.TFrame")
+        seed_wrap.pack(fill="x", padx=12, pady=6)
+        ttk.Label(seed_wrap, text="Seed (optional)", style="Meta.TLabel").pack(anchor="w")
+        self.video_seed_var = tk.StringVar(value="")
+        ttk.Entry(seed_wrap, textvariable=self.video_seed_var, style="Field.TEntry").pack(fill="x", pady=(2, 4))
+        ttk.Button(seed_wrap, text="Randomize Seed", command=self._randomize_seed, style="Secondary.TButton").pack(anchor="w")
+
+        out_wrap = ttk.Frame(controls, style="Card.TFrame")
+        out_wrap.pack(fill="x", padx=12, pady=6)
+        ttk.Label(out_wrap, text="Output", style="Meta.TLabel").pack(anchor="w")
+        self.video_output_dir_var = tk.StringVar(value=str(ROOT_DIR / "output" / "videos"))
+        ttk.Entry(out_wrap, textvariable=self.video_output_dir_var, style="Field.TEntry").pack(fill="x", pady=(2, 4))
+        out_buttons = ttk.Frame(out_wrap, style="Card.TFrame")
+        out_buttons.pack(fill="x")
+        ttk.Button(out_buttons, text="Browse...", command=self._browse_video_output_dir, style="Secondary.TButton").pack(side="left")
+        ttk.Label(out_buttons, text="Format", style="Meta.TLabel").pack(side="left", padx=(10, 6))
+        self.video_format_var = tk.StringVar(value="mp4")
+        ttk.Combobox(out_buttons, textvariable=self.video_format_var, values=["mp4", "gif"], state="readonly", width=6).pack(side="left")
+
+        self.generate_video_btn = ttk.Button(controls, text="Generate Video", command=self._on_generate_video, style="Accent.TButton")
+        self.generate_video_btn.pack(fill="x", padx=12, pady=(12, 6))
+        ttk.Button(controls, text="Open Output Folder", command=self._open_output_folder, style="Secondary.TButton").pack(fill="x", padx=12, pady=(0, 12))
+
+        self.video_status_label = ttk.Label(preview, text="Ready. Generate a DDPM dream video.", style="Status.TLabel")
+        self.video_status_label.grid(row=0, column=0, sticky="w", padx=14, pady=(12, 6))
+        self.video_progress = ttk.Progressbar(preview, orient="horizontal", mode="determinate")
+        self.video_progress.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 8))
+        self.video_preview_label = tk.Label(
+            preview, text="Preview frame will appear here",
+            bg=BG_FIELD, fg=FG_DIM, font=(FONT_FAMILY, 11),
+        )
+        self.video_preview_label.grid(row=2, column=0, sticky="nsew", padx=14, pady=(0, 8))
+        self.video_info_label = ttk.Label(
+            preview,
+            text="Uses latent walk generation. If you add a reference video, each dream frame is guided by sampled frames from it.",
+            style="Meta.TLabel", wraplength=520, justify="left",
+        )
+        self.video_info_label.grid(row=3, column=0, sticky="w", padx=14, pady=(0, 14))
+
+    def refresh_models(self):
+        checkpoints = find_checkpoints(DEFAULT_MODELS_ROOT)
+        self._model_paths_by_label = {}
+        labels = []
+        for label, path, _mtime, info in checkpoints:
+            combo_label = f"{info['display']} ({info['resolution']})"
+            labels.append(combo_label)
+            self._model_paths_by_label[combo_label] = path
+        if not labels:
+            labels = ["Pretrained demo model (128x128)"]
+            self._model_paths_by_label[labels[0]] = PRETRAINED_MODEL
+        self.video_model_combo.config(values=labels)
+        if self.video_model_var.get() not in labels:
+            self.video_model_var.set(labels[0])
+
+    def _use_generate_model(self):
+        model_path = self.app.get_preferred_model_path()
+        if not model_path:
+            messagebox.showerror("No model selected", "Select or load a model in the Generate tab first, or pick one from this tab.")
+            return
+        for label, path in self._model_paths_by_label.items():
+            if path == model_path:
+                self.video_model_var.set(label)
+                self.video_status_label.config(text=f"Using model from Generate tab: {label}")
+                return
+        resolved = find_loadable_model_inside(Path(model_path)) if model_path != PRETRAINED_MODEL else None
+        if resolved is not None:
+            label = f"{get_model_info(resolved)['display']} ({get_model_info(resolved)['resolution']})"
+            self._model_paths_by_label[label] = str(resolved)
+            self.video_model_combo.config(values=list(self._model_paths_by_label.keys()))
+            self.video_model_var.set(label)
+            self.video_status_label.config(text=f"Using model from Generate tab: {label}")
+
+    def _browse_reference_video(self):
+        chosen = filedialog.askopenfilename(
+            initialdir=str(ROOT_DIR),
+            filetypes=[("Video files", "*.mp4 *.mov *.avi *.mkv *.webm *.gif"), ("All files", "*.*")],
+        )
+        if chosen:
+            self.reference_video_var.set(chosen)
+
+    def _browse_video_output_dir(self):
+        chosen = filedialog.askdirectory(initialdir=self.video_output_dir_var.get() or str(ROOT_DIR))
+        if chosen:
+            self.video_output_dir_var.set(chosen)
+
+    def _open_output_folder(self):
+        out_dir = Path(self.video_output_dir_var.get()).expanduser()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        open_folder(out_dir)
+
+    def _randomize_seed(self):
+        self.video_seed_var.set(str(random.randint(0, 2_147_483_647)))
+
+    def _validated_video_settings(self):
+        model_label = self.video_model_var.get().strip()
+        model_path = self._model_paths_by_label.get(model_label, PRETRAINED_MODEL)
+
+        ref_path = self.reference_video_var.get().strip()
+        if ref_path and not Path(ref_path).exists():
+            messagebox.showerror("Missing reference video", f"Reference video does not exist:\n{ref_path}")
+            return None
+
+        try:
+            seconds = float(self.seconds_var.get().strip())
+            fps = int(self.fps_var.get().strip())
+            steps = int(self.video_steps.get())
+            smoothness = int(self.video_smoothness.get())
+            ref_influence = int(self.reference_influence.get())
+        except ValueError:
+            messagebox.showerror("Invalid settings", "Seconds, FPS, and sliders must contain valid numbers.")
+            return None
+
+        if seconds <= 0:
+            messagebox.showerror("Invalid length", "Seconds must be greater than 0.")
+            return None
+        if fps <= 0:
+            messagebox.showerror("Invalid FPS", "FPS must be greater than 0.")
+            return None
+
+        total_frames = int(round(seconds * fps))
+        if total_frames > 240:
+            proceed = messagebox.askyesno(
+                "Large render",
+                f"This will render {total_frames} frames with DDPM sampling, which may take a while. Continue?"
+            )
+            if not proceed:
+                return None
+
+        seed_val = self.video_seed_var.get().strip()
+        try:
+            seed = int(seed_val) if seed_val else None
+        except ValueError:
+            messagebox.showerror("Invalid seed", "Seed must be a whole number, or left blank.")
+            return None
+
+        out_dir = Path(self.video_output_dir_var.get()).expanduser()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        extension = self.video_format_var.get().strip().lower() or "mp4"
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        out_path = out_dir / f"dream_video_{stamp}.{extension}"
+
+        return {
+            "model_path": model_path,
+            "reference_video_path": ref_path or None,
+            "seconds": seconds,
+            "fps": fps,
+            "steps": steps,
+            "smoothness": smoothness,
+            "reference_influence": ref_influence / 100.0,
+            "seed": seed,
+            "output_path": out_path,
+            "total_frames": total_frames,
+        }
+
+    def _on_generate_video(self):
+        settings = self._validated_video_settings()
+        if settings is None:
+            return
+
+        self.generate_video_btn.config(state=tk.DISABLED)
+        self.video_progress.config(value=0, maximum=max(1, settings["total_frames"]))
+        self.video_status_label.config(text=f"Generating {settings['total_frames']} frame(s)...")
+        self.video_info_label.config(text="")
+
+        def progress_callback(done, total, frame_image):
+            def update():
+                self.video_progress.config(value=done, maximum=total)
+                try:
+                    from PIL import ImageTk
+                    preview_img = scale_for_display(frame_image, target_size=512)
+                    photo = ImageTk.PhotoImage(preview_img)
+                    self.video_photo_ref = photo
+                    self.video_preview_label.config(image=photo, text="")
+                except Exception:
+                    pass
+                self.video_status_label.config(text=f"Generating frame {done}/{total}...")
+            self.after(0, update)
+
+        def worker():
+            try:
+                frames = generate_video_frames(
+                    settings["model_path"],
+                    seconds=settings["seconds"],
+                    fps=settings["fps"],
+                    seed=settings["seed"],
+                    num_inference_steps=settings["steps"],
+                    smoothness=settings["smoothness"],
+                    reference_video_path=settings["reference_video_path"],
+                    reference_influence=settings["reference_influence"],
+                    progress_callback=progress_callback,
+                )
+                saved_path = save_video_frames(frames, settings["output_path"], fps=settings["fps"])
+
+                def finish():
+                    self.last_video_path = saved_path
+                    self.generate_video_btn.config(state=tk.NORMAL)
+                    self.video_progress.config(value=settings["total_frames"], maximum=settings["total_frames"])
+                    self.video_status_label.config(text=f"Done. Saved video to: {saved_path}")
+                    self.video_info_label.config(text=(
+                        f"Rendered {len(frames)} frame(s) at {settings['fps']} FPS. "
+                        f"If MP4 export wasn't available, the app automatically fell back to GIF."
+                    ))
+                self.after(0, finish)
+            except Exception as exc:
+                error_text = str(exc)[:700]
+                def fail():
+                    self.generate_video_btn.config(state=tk.NORMAL)
+                    self.video_status_label.config(text=f"Error: {error_text}")
+                    self.video_info_label.config(text="Video generation failed. If this happened during MP4 export, try GIF output first.")
+                self.after(0, fail)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
+
+# ----------------------------------------------------------------------------
 # App shell
 # ----------------------------------------------------------------------------
 class App:
@@ -1321,9 +1867,11 @@ class App:
 
         self.train_tab = TrainTab(notebook, self)
         self.generate_tab = GenerateTab(notebook, self)
+        self.video_tab = VideoTab(notebook, self)
 
         notebook.add(self.train_tab, text="  Train  ")
         notebook.add(self.generate_tab, text="  Generate  ")
+        notebook.add(self.video_tab, text="  Video  ")
         self.notebook = notebook
 
     def _setup_style(self):
@@ -1378,18 +1926,24 @@ class App:
 
     # -- Cross-tab coordination ------------------------------------------
     def set_training_active(self, active: bool):
-        """Disable Generate while training is running. The two share the
-        GPU and, more importantly, the same output_dir; generating mid-save
-        could read a half-written checkpoint."""
+        """Disable generation tabs while training is running. They share the
+        GPU and the output directory, so it's safer to avoid sampling mid-save."""
         state = tk.DISABLED if active else tk.NORMAL
         self.generate_tab.generate_btn.config(state=state)
+        self.video_tab.generate_video_btn.config(state=state)
         if active:
             self.generate_tab.gen_status_label.config(text="Training is running — Generate will unlock when it's done.")
+            self.video_tab.video_status_label.config(text="Training is running — Video will unlock when it's done.")
         else:
             self.generate_tab.gen_status_label.config(text="Ready.")
+            self.video_tab.video_status_label.config(text="Ready. Generate a DDPM dream video.")
 
     def notify_training_complete(self):
         self.generate_tab.refresh_checkpoints()
+        self.video_tab.refresh_models()
+
+    def get_preferred_model_path(self):
+        return self.generate_tab.last_model_path or self.generate_tab.get_selected_model_path()
 
 
 def main():
