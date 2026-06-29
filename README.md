@@ -1,4 +1,4 @@
-This is a simple Stable Diffusion like model that you can use to train some random images you have for the fun of it.
+This is a practical, GPU-friendly way to train and experiment with diffusion models on consumer hardware. Perfect for learning how DDPM works without needing enterprise-scale infrastructure.
 
 First, extract the downloaded zip file
 
