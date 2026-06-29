@@ -10,6 +10,7 @@ Two tabs:
 """
 
 import json
+import os
 import queue
 import random
 import shutil
@@ -55,35 +56,117 @@ PIPELINE_SOURCE = None  # path/name the cached pipeline was loaded from
 # ----------------------------------------------------------------------------
 def is_loadable_model_dir(path: Path) -> bool:
     """A complete diffusers DDPMPipeline folder contains model_index.json."""
+    path = Path(path).expanduser()
     return path.exists() and path.is_dir() and (path / "model_index.json").exists()
 
 
-def model_label(path: Path, prefix="Model") -> str:
+def looks_like_resume_checkpoint(path: Path) -> bool:
+    """Accelerate checkpoint-* folders are resume states, not Generate-ready models."""
+    path = Path(path).expanduser()
+    return path.is_dir() and path.name.startswith("checkpoint-")
+
+
+def find_loadable_model_inside(path: Path, max_depth: int = 4):
+    """Return a loadable DDPMPipeline folder from path or one of its children.
+
+    This fixes the annoying case where you pick output/, an experiment folder,
+    or a parent folder and the actual model_index.json is one level deeper.
+    """
+    path = Path(path).expanduser()
+    if is_loadable_model_dir(path):
+        return path
+    if not path.exists() or not path.is_dir():
+        return None
+
+    best = None
+    best_mtime = -1
+    root_parts = len(path.parts)
+    for model_index in path.rglob("model_index.json"):
+        model_dir = model_index.parent
+        if len(model_dir.parts) - root_parts > max_depth:
+            continue
+        try:
+            mtime = model_dir.stat().st_mtime
+        except OSError:
+            mtime = 0
+        if mtime > best_mtime:
+            best = model_dir
+            best_mtime = mtime
+    return best
+
+
+def describe_model_problem(path: Path) -> str:
+    path = Path(path).expanduser()
+    if looks_like_resume_checkpoint(path):
+        return (
+            "That looks like an Accelerate resume checkpoint folder.\n\n"
+            "checkpoint-* folders are for continuing training, not for generating images. "
+            "Pick the saved model folder that contains model_index.json instead."
+        )
+    if path.exists() and path.is_dir():
+        return (
+            "That folder is not a complete Diffusers DDPMPipeline model.\n\n"
+            "A loadable model folder needs model_index.json at the top level. "
+            "Try selecting the experiment/model folder that contains model_index.json, "
+            "or select a parent folder and let the app scan inside it."
+        )
+    return f"Folder does not exist:\n{path}"
+
+
+def get_model_resolution(path: Path):
+    config_path = Path(path) / "unet" / "config.json"
     try:
-        display = path.relative_to(ROOT_DIR)
+        data = json.loads(config_path.read_text())
+        sample_size = data.get("sample_size")
+        if isinstance(sample_size, (list, tuple)):
+            return "x".join(str(x) for x in sample_size)
+        if sample_size:
+            return f"{sample_size}x{sample_size}"
+    except Exception:
+        pass
+    return "?"
+
+
+def get_model_modified(path: Path) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(Path(path).stat().st_mtime))
+    except Exception:
+        return "?"
+
+
+def get_model_info(path: Path):
+    path = Path(path).expanduser()
+    try:
+        display = str(path.relative_to(ROOT_DIR))
     except ValueError:
-        display = path
-    return f"{prefix}: {display}"
+        display = str(path)
+    return {
+        "name": path.name or str(path),
+        "path": str(path),
+        "display": display,
+        "resolution": get_model_resolution(path),
+        "modified": get_model_modified(path),
+    }
+
+
+def model_label(path: Path, prefix="Model") -> str:
+    info = get_model_info(path)
+    return f"{prefix}: {info['display']}  ({info['resolution']}, {info['modified']})"
 
 
 def find_checkpoints(output_dir: Path = DEFAULT_MODELS_ROOT):
-    """Return every loadable DDPMPipeline folder under output_dir, newest first.
-
-    This is deliberately broader than the old app. Instead of only allowing
-    output/model, it finds older saved models too, as long as the folder has
-    model_index.json. Raw checkpoint-* folders are still ignored because those
-    are accelerator resume states, not Generate-ready pipelines.
-    """
+    """Return every loadable DDPMPipeline folder under output_dir, newest first."""
     roots = []
     for candidate in [DEFAULT_OUTPUT_DIR, output_dir, DEFAULT_MODELS_ROOT]:
-        candidate = Path(candidate)
+        candidate = Path(candidate).expanduser()
         if candidate.exists() and candidate not in roots:
             roots.append(candidate)
 
     found = {}
     for root in roots:
-        if is_loadable_model_dir(root):
-            found[str(root.resolve())] = root
+        resolved = find_loadable_model_inside(root) if not is_loadable_model_dir(root) else root
+        if resolved is not None and is_loadable_model_dir(resolved):
+            found[str(resolved.resolve())] = resolved
         if root.exists():
             for model_index in root.rglob("model_index.json"):
                 path = model_index.parent
@@ -93,20 +176,34 @@ def find_checkpoints(output_dir: Path = DEFAULT_MODELS_ROOT):
     for path in found.values():
         mtime = path.stat().st_mtime
         label = "Latest trained model" if path.resolve() == DEFAULT_OUTPUT_DIR.resolve() else model_label(path)
-        results.append((label, str(path), mtime))
+        results.append((label, str(path), mtime, get_model_info(path)))
     results.sort(key=lambda r: r[2], reverse=True)
     return results
 
 
 def copy_model_folder(src: Path, dst: Path):
-    src = Path(src)
-    dst = Path(dst)
+    src = Path(src).expanduser()
+    dst = Path(dst).expanduser()
+    src = find_loadable_model_inside(src) or src
     if not is_loadable_model_dir(src):
-        raise ValueError(f"Not a complete model folder: {src}")
+        raise ValueError(describe_model_problem(src))
     if dst.exists() and any(dst.iterdir()):
         raise FileExistsError(f"Destination already exists and is not empty: {dst}")
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(src, dst, dirs_exist_ok=True)
+
+
+def open_folder(path: Path):
+    path = Path(path).expanduser()
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(str(path))
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+    except Exception as exc:
+        messagebox.showerror("Could not open folder", str(exc))
 
 
 # ----------------------------------------------------------------------------
@@ -138,12 +235,11 @@ def load_pipeline(model_path_or_name: str):
     return pipeline
 
 
-def generate_image(model_path_or_name: str, seed=None):
-    """Run inference and return a PIL Image.
+def generate_images(model_path_or_name: str, seed=None, num_inference_steps=50, batch_size=1):
+    """Run inference and return a list of PIL Images.
 
-    Note: resolution is NOT a parameter here — it's baked into the trained
-    UNet's sample_size and can't be changed at generation time. Resolution
-    is a *training*-time setting (see TrainTab), not a generation-time one.
+    Resolution is baked into the trained UNet sample_size, so the Generate tab
+    shows it as model info instead of pretending it can be changed safely.
     """
     import torch
 
@@ -151,15 +247,20 @@ def generate_image(model_path_or_name: str, seed=None):
     device = next(pipeline.unet.parameters()).device
     generator = None
     if seed is not None:
-        generator = torch.Generator(device=device).manual_seed(int(seed))
+        # For a batch, make deterministic-but-different samples from the same seed.
+        generator = [torch.Generator(device=device).manual_seed(int(seed) + i) for i in range(int(batch_size))]
 
-    image = pipeline(
+    images = pipeline(
         generator=generator,
-        batch_size=1,
-        num_inference_steps=50,
+        batch_size=int(batch_size),
+        num_inference_steps=int(num_inference_steps),
         output_type="pil",
-    ).images[0]
-    return image
+    ).images
+    return images
+
+
+def generate_image(model_path_or_name: str, seed=None):
+    return generate_images(model_path_or_name, seed=seed, num_inference_steps=50, batch_size=1)[0]
 
 
 def scale_for_display(image, target_size=512):
@@ -222,6 +323,31 @@ class LabeledCombo(ttk.Frame):
 
     def get(self):
         return self.var.get().strip()
+
+
+class LabeledScale(ttk.Frame):
+    """Label + slider + value readout."""
+
+    def __init__(self, parent, label, from_, to, default, width=160, tooltip=None):
+        super().__init__(parent, style="Panel.TFrame")
+        self.var = tk.IntVar(value=int(default))
+        row = ttk.Frame(self, style="Panel.TFrame")
+        row.pack(fill="x")
+        lbl = ttk.Label(row, text=label, style="Field.TLabel")
+        lbl.pack(side="left")
+        self.value_label = ttk.Label(row, text=str(default), style="Field.TLabel")
+        self.value_label.pack(side="right")
+        scale = ttk.Scale(
+            self, from_=from_, to=to, orient="horizontal", variable=self.var,
+            command=lambda _v: self.value_label.config(text=str(self.get())), length=width,
+        )
+        scale.pack(fill="x", pady=(2, 0))
+        if tooltip:
+            Tooltip(scale, tooltip)
+            Tooltip(lbl, tooltip)
+
+    def get(self):
+        return int(round(self.var.get()))
 
 
 class Tooltip:
@@ -484,11 +610,17 @@ class TrainTab(ttk.Frame):
         if not chosen:
             return
         path = Path(chosen)
-        if not is_loadable_model_dir(path):
-            messagebox.showerror("Not a loadable model", "Pick a trained model folder that contains model_index.json.")
+        resolved = find_loadable_model_inside(path)
+        if resolved is None:
+            messagebox.showerror("Not a loadable model", describe_model_problem(path))
             return
-        self.base_model_var.set(str(path))
-        self._try_apply_model_resolution(path)
+        if resolved != path:
+            messagebox.showinfo(
+                "Model found inside folder",
+                f"I found the loadable model here instead:\n{resolved}"
+            )
+        self.base_model_var.set(str(resolved))
+        self._try_apply_model_resolution(resolved)
 
     def _browse_output_dir(self):
         chosen = filedialog.askdirectory(initialdir=str(DEFAULT_MODELS_ROOT if DEFAULT_MODELS_ROOT.exists() else ROOT_DIR))
@@ -597,8 +729,13 @@ class TrainTab(ttk.Frame):
             errors.append("Pick an output folder to save the trained model.")
 
         base_model = self.base_model_var.get().strip()
-        if base_model and not is_loadable_model_dir(Path(base_model)):
-            errors.append("Start-from model must be a complete trained model folder containing model_index.json.")
+        if base_model:
+            resolved_base = find_loadable_model_inside(Path(base_model))
+            if resolved_base is None:
+                errors.append("Start-from model must be a complete trained model folder containing model_index.json.")
+            else:
+                base_model = str(resolved_base)
+                self.base_model_var.set(base_model)
 
         if errors:
             return None, errors
@@ -822,46 +959,111 @@ class GenerateTab(ttk.Frame):
         super().__init__(parent, style="Panel.TFrame")
         self.app = app
         self.photo_ref = None  # keep a reference so Tk doesn't garbage-collect it
+        self.last_images = []
+        self.last_model_path = None
+        self._checkpoint_paths = {}
+        self._model_infos = {}
         self._build_ui()
         self.refresh_checkpoints()
 
     def _build_ui(self):
         self.columnconfigure(0, weight=0)
         self.columnconfigure(1, weight=1)
-        self.rowconfigure(1, weight=1)
+        self.rowconfigure(2, weight=1)
 
-        top = ttk.Frame(self, style="Panel.TFrame")
-        top.grid(row=0, column=0, columnspan=2, sticky="ew", padx=16, pady=16)
-        top.columnconfigure(1, weight=1)
+        header = ttk.Label(self, text="Model Library", style="Heading.TLabel")
+        header.grid(row=0, column=0, columnspan=2, sticky="w", padx=16, pady=(16, 8))
 
-        ttk.Label(top, text="Model", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        self.model_var = tk.StringVar()
-        self.model_combo = ttk.Combobox(top, textvariable=self.model_var, state="readonly", width=40)
-        self.model_combo.grid(row=0, column=1, sticky="ew", padx=(0, 8))
-        refresh_btn = ttk.Button(top, text="Refresh", command=self.refresh_checkpoints, style="Secondary.TButton")
-        refresh_btn.grid(row=0, column=2)
-        browse_btn = ttk.Button(top, text="Load Any Model...", command=self._browse_model, style="Secondary.TButton")
-        browse_btn.grid(row=0, column=3, padx=(6, 0))
-        save_btn = ttk.Button(top, text="Save Selected As...", command=self._save_selected_model_as, style="Secondary.TButton")
-        save_btn.grid(row=0, column=4, padx=(6, 0))
+        library = ttk.Frame(self, style="Card.TFrame")
+        library.grid(row=1, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 10))
+        library.columnconfigure(0, weight=1)
 
-        seed_row = ttk.Frame(self, style="Panel.TFrame")
-        seed_row.grid(row=2, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 8))
-        ttk.Label(seed_row, text="Seed (optional):", style="Field.TLabel").pack(side="left", padx=(0, 6))
-        self.seed_var = tk.StringVar(value="")
-        ttk.Entry(seed_row, textvariable=self.seed_var, width=12, style="Field.TEntry").pack(side="left")
-
-        self.generate_btn = ttk.Button(
-            seed_row, text="Generate", command=self._on_generate, style="Accent.TButton"
+        self.model_tree = ttk.Treeview(
+            library,
+            columns=("resolution", "modified", "path"),
+            show="headings",
+            height=6,
+            selectmode="browse",
         )
-        self.generate_btn.pack(side="left", padx=(16, 0))
+        self.model_tree.heading("resolution", text="Resolution")
+        self.model_tree.heading("modified", text="Modified")
+        self.model_tree.heading("path", text="Model folder")
+        self.model_tree.column("resolution", width=90, stretch=False)
+        self.model_tree.column("modified", width=135, stretch=False)
+        self.model_tree.column("path", width=420, stretch=True)
+        self.model_tree.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+        self.model_tree.bind("<<TreeviewSelect>>", self._on_model_tree_select)
+        self.model_tree.bind("<Double-1>", lambda _e: self._load_selected_tree_model())
 
-        self.gen_status_label = ttk.Label(self, text="Ready.", style="Status.TLabel")
-        self.gen_status_label.grid(row=3, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 8))
+        library_buttons = ttk.Frame(library, style="Card.TFrame")
+        library_buttons.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
+        ttk.Button(library_buttons, text="Refresh Library", command=self.refresh_checkpoints, style="Secondary.TButton").pack(side="left")
+        ttk.Button(library_buttons, text="Scan/Load Folder...", command=self._browse_model, style="Secondary.TButton").pack(side="left", padx=(8, 0))
+        ttk.Button(library_buttons, text="Use Selected Model", command=self._load_selected_tree_model, style="Accent.TButton").pack(side="left", padx=(8, 0))
+        ttk.Button(library_buttons, text="Open Folder", command=self._open_selected_model_folder, style="Secondary.TButton").pack(side="left", padx=(8, 0))
+        ttk.Button(library_buttons, text="Save Selected As...", command=self._save_selected_model_as, style="Secondary.TButton").pack(side="left", padx=(8, 0))
 
-        image_frame = ttk.Frame(self, style="Card.TFrame")
-        image_frame.grid(row=4, column=0, columnspan=2, sticky="nsew", padx=16, pady=(0, 16))
-        self.rowconfigure(4, weight=1)
+        main = ttk.Frame(self, style="Panel.TFrame")
+        main.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=16)
+        main.columnconfigure(0, weight=0)
+        main.columnconfigure(1, weight=1)
+        main.rowconfigure(1, weight=1)
+
+        controls = ttk.Frame(main, style="Card.TFrame")
+        controls.grid(row=0, column=0, rowspan=2, sticky="ns", padx=(0, 12), pady=(0, 16))
+
+        ttk.Label(controls, text="Generation Controls", style="Meta.TLabel").pack(anchor="w", padx=12, pady=(12, 8))
+        self.selected_model_label = ttk.Label(controls, text="Selected: --", style="Meta.TLabel", wraplength=240, justify="left")
+        self.selected_model_label.pack(anchor="w", padx=12, pady=(0, 10))
+
+        self.preset = LabeledCombo(
+            controls, "Preset", values=["Balanced", "Dreamy", "Clean", "Chaotic", "Fast Preview"], default="Balanced", width=18,
+            tooltip="Presets mainly adjust denoising steps and seed behavior. They don't fake a new training resolution."
+        )
+        self.preset.pack(fill="x", padx=12, pady=6)
+        self.preset.var.trace_add("write", lambda *_: self._apply_preset())
+
+        self.steps = LabeledScale(
+            controls, "Inference steps", from_=10, to=250, default=75,
+            tooltip="More steps usually means cleaner/more settled images, but slower generation."
+        )
+        self.steps.pack(fill="x", padx=12, pady=6)
+
+        self.batch_count = LabeledCombo(
+            controls, "Images", values=["1", "2", "4", "8"], default="1", width=8,
+            tooltip="Generate several dream samples at once. Uses more VRAM while generating."
+        )
+        self.batch_count.pack(fill="x", padx=12, pady=6)
+
+        self.display_size = LabeledCombo(
+            controls, "Preview size", values=["256", "384", "512", "768"], default="512", width=8,
+            tooltip="Only changes how big the image appears in the app. The model's real resolution stays the same."
+        )
+        self.display_size.pack(fill="x", padx=12, pady=6)
+
+        seed_frame = ttk.Frame(controls, style="Card.TFrame")
+        seed_frame.pack(fill="x", padx=12, pady=(8, 4))
+        ttk.Label(seed_frame, text="Seed (optional)", style="Meta.TLabel").pack(anchor="w")
+        self.seed_var = tk.StringVar(value="")
+        ttk.Entry(seed_frame, textvariable=self.seed_var, width=18, style="Field.TEntry").pack(anchor="w", fill="x", pady=(2, 0))
+        ttk.Button(seed_frame, text="Randomize Seed", command=self._randomize_seed, style="Secondary.TButton").pack(anchor="w", pady=(6, 0))
+
+        out_frame = ttk.Frame(controls, style="Card.TFrame")
+        out_frame.pack(fill="x", padx=12, pady=(8, 4))
+        ttk.Label(out_frame, text="Save generated images to", style="Meta.TLabel").pack(anchor="w")
+        self.image_output_dir_var = tk.StringVar(value=str(ROOT_DIR / "output" / "generations"))
+        ttk.Entry(out_frame, textvariable=self.image_output_dir_var, width=24, style="Field.TEntry").pack(anchor="w", fill="x", pady=(2, 0))
+        ttk.Button(out_frame, text="Browse...", command=self._browse_image_output_dir, style="Secondary.TButton").pack(anchor="w", pady=(6, 0))
+
+        self.generate_btn = ttk.Button(controls, text="Generate", command=self._on_generate, style="Accent.TButton")
+        self.generate_btn.pack(fill="x", padx=12, pady=(14, 6))
+        ttk.Button(controls, text="Save Last Image(s)", command=self._save_last_images, style="Secondary.TButton").pack(fill="x", padx=12, pady=(0, 12))
+
+        self.gen_status_label = ttk.Label(main, text="Ready.", style="Status.TLabel")
+        self.gen_status_label.grid(row=0, column=1, sticky="w", pady=(0, 8))
+
+        image_frame = ttk.Frame(main, style="Card.TFrame")
+        image_frame.grid(row=1, column=1, sticky="nsew", pady=(0, 16))
         self.image_label = tk.Label(
             image_frame, text="Image will appear here", bg=BG_FIELD, fg=FG_DIM, font=(FONT_FAMILY, 12),
         )
@@ -869,94 +1071,236 @@ class GenerateTab(ttk.Frame):
 
     def refresh_checkpoints(self):
         checkpoints = find_checkpoints(DEFAULT_MODELS_ROOT)
-        labels = [c[0] for c in checkpoints]
-        self._checkpoint_paths = {c[0]: c[1] for c in checkpoints}
-        if not labels:
-            labels = ["No trained model yet (will use pretrained demo model)"]
-            self._checkpoint_paths[labels[0]] = PRETRAINED_MODEL
-        self.model_combo.config(values=labels)
-        if self.model_var.get() not in labels:
-            self.model_var.set(labels[0])
+        previous_path = self.get_selected_model_path()
+        self._checkpoint_paths = {}
+        self._model_infos = {}
+        self.model_tree.delete(*self.model_tree.get_children())
+
+        for idx, item in enumerate(checkpoints):
+            label, path, _mtime, info = item
+            key = f"model_{idx}"
+            self._checkpoint_paths[key] = path
+            self._model_infos[key] = info
+            self.model_tree.insert("", "end", iid=key, values=(info["resolution"], info["modified"], info["display"]))
+
+        if not checkpoints:
+            key = "pretrained_demo"
+            self._checkpoint_paths[key] = PRETRAINED_MODEL
+            self._model_infos[key] = {"display": "Pretrained demo model", "resolution": "128x128", "modified": "online", "path": PRETRAINED_MODEL}
+            self.model_tree.insert("", "end", iid=key, values=("128x128", "online", "Pretrained demo model"))
+
+        # Keep previous selection when possible.
+        target_key = None
+        if previous_path:
+            for key, path in self._checkpoint_paths.items():
+                if path == previous_path:
+                    target_key = key
+                    break
+        if target_key is None and self.model_tree.get_children():
+            target_key = self.model_tree.get_children()[0]
+        if target_key:
+            self.model_tree.selection_set(target_key)
+            self.model_tree.focus(target_key)
+            self._on_model_tree_select()
+
+    def get_selected_model_key(self):
+        selection = self.model_tree.selection()
+        if selection:
+            return selection[0]
+        focus = self.model_tree.focus()
+        return focus or None
+
+    def get_selected_model_path(self):
+        key = self.get_selected_model_key()
+        if key:
+            return self._checkpoint_paths.get(key)
+        return None
+
+    def _on_model_tree_select(self, _event=None):
+        key = self.get_selected_model_key()
+        info = self._model_infos.get(key, {})
+        text = f"Selected: {info.get('display', '--')}\nResolution: {info.get('resolution', '?')}"
+        self.selected_model_label.config(text=text)
+
+    def _load_selected_tree_model(self):
+        path = self.get_selected_model_path()
+        if not path:
+            messagebox.showerror("No model selected", "Select a model from the library first.")
+            return
+        self.last_model_path = path
+        info = self._model_infos.get(self.get_selected_model_key(), {})
+        self.gen_status_label.config(text=f"Ready to generate with: {info.get('display', path)}")
 
     def _browse_model(self):
         chosen = filedialog.askdirectory(initialdir=str(DEFAULT_MODELS_ROOT if DEFAULT_MODELS_ROOT.exists() else ROOT_DIR))
         if not chosen:
             return
         path = Path(chosen)
-        if not is_loadable_model_dir(path):
-            messagebox.showerror("Not a loadable model", "Pick a trained model folder that contains model_index.json.")
+        resolved = find_loadable_model_inside(path)
+        if resolved is None:
+            messagebox.showerror("Not a loadable model", describe_model_problem(path))
             return
-        label = model_label(path, prefix="Loaded")
-        self._checkpoint_paths[label] = str(path)
-        values = list(self.model_combo.cget("values"))
-        if label not in values:
-            values.insert(0, label)
-            self.model_combo.config(values=values)
-        self.model_var.set(label)
-        self.gen_status_label.config(text=f"Loaded model folder: {path}")
+        if resolved != path:
+            messagebox.showinfo("Model found inside folder", f"I found the loadable model here instead:\n{resolved}")
+
+        key = f"loaded_{len(self._checkpoint_paths)}"
+        info = get_model_info(resolved)
+        self._checkpoint_paths[key] = str(resolved)
+        self._model_infos[key] = info
+        if key not in self.model_tree.get_children():
+            self.model_tree.insert("", 0, iid=key, values=(info["resolution"], info["modified"], info["display"]))
+        self.model_tree.selection_set(key)
+        self.model_tree.focus(key)
+        self._on_model_tree_select()
+        self._load_selected_tree_model()
+
+    def _open_selected_model_folder(self):
+        path = self.get_selected_model_path()
+        if not path or path == PRETRAINED_MODEL:
+            messagebox.showerror("No local folder", "Select a local trained model first.")
+            return
+        open_folder(path)
 
     def _save_selected_model_as(self):
-        label = self.model_var.get()
-        src = self._checkpoint_paths.get(label)
+        src = self.get_selected_model_path()
         if not src or src == PRETRAINED_MODEL:
             messagebox.showerror("Cannot save this", "Pick a local trained model folder first.")
             return
         src_path = Path(src)
-        if not is_loadable_model_dir(src_path):
-            messagebox.showerror("Cannot save this", "The selected item is not a complete local model folder.")
+        resolved = find_loadable_model_inside(src_path)
+        if resolved is None:
+            messagebox.showerror("Cannot save this", describe_model_problem(src_path))
             return
         chosen = filedialog.askdirectory(initialdir=str(DEFAULT_MODELS_ROOT if DEFAULT_MODELS_ROOT.exists() else ROOT_DIR))
         if not chosen:
             return
         dst = Path(chosen)
         try:
-            copy_model_folder(src_path, dst)
+            copy_model_folder(resolved, dst)
         except Exception as e:
             messagebox.showerror("Save failed", str(e))
             return
         self.refresh_checkpoints()
         self.gen_status_label.config(text=f"Saved selected model to: {dst}")
 
-    def _on_generate(self):
-        label = self.model_var.get()
-        model_path = self._checkpoint_paths.get(label, PRETRAINED_MODEL)
+    def _browse_image_output_dir(self):
+        chosen = filedialog.askdirectory(initialdir=self.image_output_dir_var.get() or str(ROOT_DIR))
+        if chosen:
+            self.image_output_dir_var.set(chosen)
+
+    def _randomize_seed(self):
+        self.seed_var.set(str(random.randint(0, 2_147_483_647)))
+
+    def _apply_preset(self):
+        preset = self.preset.get()
+        if preset == "Fast Preview":
+            self.steps.var.set(25)
+        elif preset == "Clean":
+            self.steps.var.set(150)
+        elif preset == "Dreamy":
+            self.steps.var.set(100)
+        elif preset == "Chaotic":
+            self.steps.var.set(40)
+            self.seed_var.set("")
+        else:
+            self.steps.var.set(75)
+        self.steps.value_label.config(text=str(self.steps.get()))
+
+    def _validated_generation_settings(self):
+        model_path = self.last_model_path or self.get_selected_model_path() or PRETRAINED_MODEL
         seed_val = self.seed_var.get().strip()
         try:
             seed = int(seed_val) if seed_val else None
         except ValueError:
             messagebox.showerror("Invalid seed", "Seed must be a whole number, or left blank.")
+            return None
+        try:
+            batch_count = int(self.batch_count.get())
+            preview_size = int(self.display_size.get())
+            steps = max(1, int(self.steps.get()))
+        except ValueError:
+            messagebox.showerror("Invalid generation settings", "Generation settings must be whole numbers.")
+            return None
+        return {
+            "model_path": model_path,
+            "seed": seed,
+            "steps": steps,
+            "batch_count": batch_count,
+            "preview_size": preview_size,
+        }
+
+    def _on_generate(self):
+        settings = self._validated_generation_settings()
+        if settings is None:
             return
 
         self.generate_btn.config(state=tk.DISABLED)
-        self.gen_status_label.config(text="Generating...")
+        self.gen_status_label.config(text=f"Generating {settings['batch_count']} image(s) at {settings['steps']} steps...")
 
         def work():
             try:
-                image = generate_image(model_path, seed=seed)
-                from PIL import ImageTk
+                images = generate_images(
+                    settings["model_path"],
+                    seed=settings["seed"],
+                    num_inference_steps=settings["steps"],
+                    batch_size=settings["batch_count"],
+                )
+                from PIL import Image as PILImage, ImageTk
 
-                display_image = scale_for_display(image, target_size=512)
-                photo = ImageTk.PhotoImage(display_image)
+                # Make a simple preview grid for the app display.
+                display_images = [scale_for_display(img, target_size=settings["preview_size"]) for img in images]
+                cols = min(4, len(display_images))
+                rows = (len(display_images) + cols - 1) // cols
+                w = max(img.width for img in display_images)
+                h = max(img.height for img in display_images)
+                grid = PILImage.new("RGB", (cols * w, rows * h), (30, 34, 43))
+                for i, img in enumerate(display_images):
+                    grid.paste(img.convert("RGB"), ((i % cols) * w, (i // cols) * h))
+                photo = ImageTk.PhotoImage(grid)
 
                 def update_ui():
+                    self.last_images = images
                     self.photo_ref = photo
                     self.image_label.config(image=photo, text="")
+                    first = images[0]
                     self.gen_status_label.config(
-                        text=f"Done. (generated at {image.width}x{image.height}, shown enlarged)"
+                        text=f"Done. Native model output: {first.width}x{first.height}. Preview shown enlarged."
                     )
                     self.generate_btn.config(state=tk.NORMAL)
 
                 self.after(0, update_ui)
             except Exception as e:
-                error_text = str(e)[:200]
+                error_text = str(e)[:500]
 
                 def show_error():
-                    self.gen_status_label.config(text=f"Error: {error_text}")
+                    friendly = error_text
+                    if "model_index.json" in error_text or "Error no file named" in error_text:
+                        friendly = (
+                            "Could not load that folder as a complete model. "
+                            "Try selecting the saved model folder that contains model_index.json, "
+                            "not a checkpoint-* resume folder.\n\n"
+                            + error_text[:250]
+                        )
+                    self.gen_status_label.config(text=f"Error: {friendly}")
                     self.generate_btn.config(state=tk.NORMAL)
 
                 self.after(0, show_error)
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _save_last_images(self):
+        if not self.last_images:
+            messagebox.showerror("No images yet", "Generate an image first.")
+            return
+        out_dir = Path(self.image_output_dir_var.get()).expanduser()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        saved = []
+        for idx, img in enumerate(self.last_images, start=1):
+            path = out_dir / f"generation_{stamp}_{idx:02d}.png"
+            img.save(path)
+            saved.append(path)
+        self.gen_status_label.config(text=f"Saved {len(saved)} image(s) to: {out_dir}")
 
 
 # ----------------------------------------------------------------------------
@@ -966,8 +1310,8 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("Diffusion Styler")
-        root.geometry("760x780")
-        root.minsize(640, 600)
+        root.geometry("980x840")
+        root.minsize(820, 680)
         root.configure(bg=BG)
 
         self._setup_style()
@@ -1028,6 +1372,9 @@ class App:
 
         style.configure("TCombobox", fieldbackground=BG_FIELD, background=BG_FIELD, foreground=FG)
         style.configure("Horizontal.TProgressbar", background=ACCENT, troughcolor=BG_FIELD, borderwidth=0)
+        style.configure("Treeview", background=BG_FIELD, fieldbackground=BG_FIELD, foreground=FG, rowheight=24, borderwidth=0)
+        style.configure("Treeview.Heading", background=BG_PANEL, foreground=FG, font=(FONT_FAMILY, 9, "bold"))
+        style.map("Treeview", background=[("selected", ACCENT_DIM)], foreground=[("selected", FG)])
 
     # -- Cross-tab coordination ------------------------------------------
     def set_training_active(self, active: bool):
