@@ -45,10 +45,25 @@ TRAIN_SCRIPT = ROOT_DIR / "train.py"
 DEFAULT_OUTPUT_DIR = ROOT_DIR / "output" / "model"
 DEFAULT_MODELS_ROOT = ROOT_DIR / "output"
 DEFAULT_DATA_DIR = ROOT_DIR / "data"
+DEFAULT_GENERATIONS_DIR = ROOT_DIR / "output" / "generations"
+MODEL_INFO_FILE = "model_info.json"
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif"}
 PRETRAINED_MODEL = "anton-l/ddpm-butterflies-128"
 
 PIPELINE = None  # lazily-loaded diffusers pipeline, cached across generations
 PIPELINE_SOURCE = None  # path/name the cached pipeline was loaded from
+PIPELINE_SCHEDULER_CONFIG = None  # original scheduler config, used when swapping samplers
+
+SAMPLER_DESCRIPTIONS = {
+    "DDPM": (
+        "Classic denoising diffusion sampler. Slower, very stable, and a good baseline. "
+        "Use this when you want the normal DDPM dream look."
+    ),
+    "DDIM": (
+        "Denoising Diffusion Implicit Model sampler. Usually much faster at lower step counts, "
+        "more deterministic with the same seed, and great for quick previews/generation."
+    ),
+}
 
 
 # ----------------------------------------------------------------------------
@@ -134,24 +149,80 @@ def get_model_modified(path: Path) -> str:
         return "?"
 
 
+def sanitize_filename_component(name: str, fallback="Model") -> str:
+    """Make a friendly model/generation name safe for Windows/macOS/Linux folders."""
+    name = str(name or "").strip()
+    bad_chars = '<>:"/\\|?*'
+    cleaned = []
+    for ch in name:
+        if ch in bad_chars or ord(ch) < 32:
+            cleaned.append("_")
+        else:
+            cleaned.append(ch)
+    cleaned = "".join(cleaned).strip(" ._")
+    while "  " in cleaned:
+        cleaned = cleaned.replace("  ", " ")
+    if not cleaned:
+        cleaned = fallback
+    reserved = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+    if cleaned.upper() in reserved:
+        cleaned = f"{cleaned}_Model"
+    return cleaned[:80]
+
+
+def unique_child_dir(parent: Path, desired_name: str) -> Path:
+    """Return parent/desired_name, or parent/desired_name 1, 2, 3... if needed."""
+    parent = Path(parent).expanduser()
+    base = sanitize_filename_component(desired_name)
+    candidate = parent / base
+    counter = 1
+    while candidate.exists():
+        candidate = parent / f"{base} {counter}"
+        counter += 1
+    return candidate
+
+
+def read_model_metadata(path: Path):
+    path = Path(path).expanduser()
+    metadata_path = path / MODEL_INFO_FILE
+    try:
+        if metadata_path.exists():
+            data = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def get_friendly_model_name(path: Path) -> str:
+    metadata = read_model_metadata(path)
+    name = metadata.get("model_name") or Path(path).name or "Model"
+    return sanitize_filename_component(name, fallback="Model")
+
+
 def get_model_info(path: Path):
     path = Path(path).expanduser()
+    metadata = read_model_metadata(path)
+    model_name = sanitize_filename_component(metadata.get("model_name") or path.name or str(path), fallback="Model")
     try:
         display = str(path.relative_to(ROOT_DIR))
     except ValueError:
         display = str(path)
     return {
-        "name": path.name or str(path),
+        "name": model_name,
+        "model_name": model_name,
         "path": str(path),
         "display": display,
         "resolution": get_model_resolution(path),
         "modified": get_model_modified(path),
+        "metadata": metadata,
     }
 
 
 def model_label(path: Path, prefix="Model") -> str:
     info = get_model_info(path)
-    return f"{prefix}: {info['display']}  ({info['resolution']}, {info['modified']})"
+    return f"{prefix}: {info['model_name']}  ({info['resolution']}, {info['modified']})"
 
 
 def find_checkpoints(output_dir: Path = DEFAULT_MODELS_ROOT):
@@ -175,8 +246,9 @@ def find_checkpoints(output_dir: Path = DEFAULT_MODELS_ROOT):
     results = []
     for path in found.values():
         mtime = path.stat().st_mtime
-        label = "Latest trained model" if path.resolve() == DEFAULT_OUTPUT_DIR.resolve() else model_label(path)
-        results.append((label, str(path), mtime, get_model_info(path)))
+        info = get_model_info(path)
+        label = f"Latest trained model: {info['model_name']}" if path.resolve() == DEFAULT_OUTPUT_DIR.resolve() else model_label(path)
+        results.append((label, str(path), mtime, info))
     results.sort(key=lambda r: r[2], reverse=True)
     return results
 
@@ -211,7 +283,7 @@ def open_folder(path: Path):
 # and doesn't need subprocess isolation the way training does)
 # ----------------------------------------------------------------------------
 def load_pipeline(model_path_or_name: str):
-    global PIPELINE, PIPELINE_SOURCE
+    global PIPELINE, PIPELINE_SOURCE, PIPELINE_SCHEDULER_CONFIG
     if PIPELINE is not None and PIPELINE_SOURCE == model_path_or_name:
         return PIPELINE
 
@@ -232,10 +304,25 @@ def load_pipeline(model_path_or_name: str):
 
     PIPELINE = pipeline
     PIPELINE_SOURCE = model_path_or_name
+    PIPELINE_SCHEDULER_CONFIG = dict(pipeline.scheduler.config)
     return pipeline
 
 
-def generate_images(model_path_or_name: str, seed=None, num_inference_steps=50, batch_size=1):
+def apply_sampler_to_pipeline(pipeline, sampler="DDPM"):
+    """Swap only the inference scheduler; the trained UNet/model stays the same."""
+    global PIPELINE_SCHEDULER_CONFIG
+    from diffusers import DDIMScheduler, DDPMScheduler
+
+    sampler = (sampler or "DDPM").upper()
+    config = PIPELINE_SCHEDULER_CONFIG or dict(pipeline.scheduler.config)
+    if sampler == "DDIM":
+        pipeline.scheduler = DDIMScheduler.from_config(config)
+    else:
+        pipeline.scheduler = DDPMScheduler.from_config(config)
+    return pipeline
+
+
+def generate_images(model_path_or_name: str, seed=None, num_inference_steps=50, batch_size=1, sampler="DDPM"):
     """Run inference and return a list of PIL Images.
 
     Resolution is baked into the trained UNet sample_size, so the Generate tab
@@ -244,6 +331,7 @@ def generate_images(model_path_or_name: str, seed=None, num_inference_steps=50, 
     import torch
 
     pipeline = load_pipeline(model_path_or_name)
+    pipeline = apply_sampler_to_pipeline(pipeline, sampler=sampler)
     device = next(pipeline.unet.parameters()).device
     generator = None
     if seed is not None:
@@ -259,8 +347,8 @@ def generate_images(model_path_or_name: str, seed=None, num_inference_steps=50, 
     return images
 
 
-def generate_image(model_path_or_name: str, seed=None):
-    return generate_images(model_path_or_name, seed=seed, num_inference_steps=50, batch_size=1)[0]
+def generate_image(model_path_or_name: str, seed=None, sampler="DDPM"):
+    return generate_images(model_path_or_name, seed=seed, num_inference_steps=50, batch_size=1, sampler=sampler)[0]
 
 
 def _get_model_sample_size(unet):
@@ -398,6 +486,8 @@ def generate_video_frames(
     smoothness=85,
     reference_video_path=None,
     reference_influence=0.6,
+    reference_mode="Dreamify/Reconstruct",
+    source_preservation=0.55,
     progress_callback=None,
 ):
     import torch
@@ -430,10 +520,11 @@ def generate_video_frames(
             fresh_noise = torch.randn(current_noise.shape, generator=generator, device=device, dtype=dtype)
             current_noise = _normalize_noise_tensor((1.0 - drift_alpha) * current_noise + drift_alpha * fresh_noise)
 
-        if reference_frames:
+        ref_image = reference_frames[min(frame_index, len(reference_frames) - 1)] if reference_frames else None
+        if ref_image is not None:
             frame_tensor = _sample_with_pipeline_from_reference(
                 pipeline,
-                reference_frames[min(frame_index, len(reference_frames) - 1)],
+                ref_image,
                 current_noise,
                 num_inference_steps=num_inference_steps,
                 reference_influence=reference_influence,
@@ -446,6 +537,22 @@ def generate_video_frames(
             )
 
         frame_image = _model_tensor_to_pil(frame_tensor)
+
+        # APVD-inspired Dreamify/Reconstruct mode:
+        # keep the reference frame as the structural anchor and let DDPM only
+        # push it into the model's dream style. This avoids the "same silhouette,
+        # totally different object" problem caused by full DDPM reimagination.
+        if ref_image is not None and str(reference_mode).lower().startswith("dreamify"):
+            preserve = max(0.0, min(1.0, float(source_preservation)))
+            dream_amount = 1.0 - preserve
+            ref_resized = ref_image.convert("RGB").resize(frame_image.size)
+            
+            if dream_amount <= 0:
+                frame_image = ref_resized
+            else:
+                from PIL import Image as PILImage
+                frame_image = PILImage.blend(ref_resized, frame_image.convert("RGB"), dream_amount)
+
         frames.append(frame_image)
 
         if progress_callback is not None:
@@ -636,6 +743,96 @@ def parse_progress_line(line: str):
         return None
 
 
+CUDA_CPU_WARNING_MESSAGE = (
+    "CUDA GPU not available. PyTorch is running on CPU. "
+    "Training DDPM models on CPU will be extremely slow. "
+    "Your GPU may be too old for modern PyTorch CUDA."
+)
+
+
+def _run_nvidia_smi_gpu_names():
+    """Best-effort Windows/Linux NVIDIA GPU name lookup, even when PyTorch CUDA is unavailable."""
+    try:
+        completed = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0,
+        )
+        if completed.returncode == 0:
+            names = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+            if names:
+                return names
+    except Exception:
+        pass
+    return []
+
+
+def get_cuda_startup_report():
+    """Return a small CUDA/PyTorch report for user-facing startup warnings."""
+    report = {
+        "torch_imported": False,
+        "cuda_available": False,
+        "torch_version": "unknown",
+        "torch_cuda_version": None,
+        "device_name": None,
+        "nvidia_smi_names": [],
+        "error": None,
+    }
+    try:
+        import torch
+        report["torch_imported"] = True
+        report["torch_version"] = getattr(torch, "__version__", "unknown")
+        report["torch_cuda_version"] = getattr(getattr(torch, "version", None), "cuda", None)
+        report["cuda_available"] = bool(torch.cuda.is_available())
+        if report["cuda_available"]:
+            report["device_name"] = torch.cuda.get_device_name(0)
+    except Exception as exc:
+        report["error"] = str(exc)
+
+    if not report["cuda_available"]:
+        report["nvidia_smi_names"] = _run_nvidia_smi_gpu_names()
+    return report
+
+
+def build_cuda_warning_text(report):
+    lines = [
+        CUDA_CPU_WARNING_MESSAGE,
+        "",
+        "Possible reasons:",
+        "• Your NVIDIA GPU is too old for this version of CUDA/PyTorch.",
+        "• You installed the CPU-only version of PyTorch.",
+        "• Your NVIDIA driver/CUDA setup is missing or outdated.",
+        "• You are using an AMD or Intel GPU. CUDA is NVIDIA-only.",
+        "",
+        "Recommended hardware:",
+        "• GTX 1060 / GTX 1660 or newer",
+        "• RTX 20, 30, 40, or newer",
+        "",
+        "Detected device:",
+    ]
+    if report.get("device_name"):
+        lines.append(f"• {report['device_name']}")
+    elif report.get("nvidia_smi_names"):
+        for name in report["nvidia_smi_names"]:
+            lines.append(f"• {name} (seen by NVIDIA driver, but not usable by PyTorch CUDA)")
+    else:
+        lines.append("• No supported CUDA GPU detected by PyTorch")
+
+    if report.get("torch_imported"):
+        lines.extend([
+            "",
+            f"PyTorch version: {report.get('torch_version')}",
+            f"PyTorch CUDA build: {report.get('torch_cuda_version') or 'CPU-only / unavailable'}",
+        ])
+    elif report.get("error"):
+        lines.extend(["", f"PyTorch import error: {report['error']}"])
+
+    lines.extend(["", "Continue anyway on CPU?"])
+    return "\n".join(lines)
+
+
 # ----------------------------------------------------------------------------
 # Train tab
 # ----------------------------------------------------------------------------
@@ -653,6 +850,8 @@ class TrainTab(ttk.Frame):
         self.last_saved_model_dir = None
         self.preview_photo_ref = None
         self.dataset_photo_ref = None
+        self.conveyor_state = None
+        self.conveyor_prefetch_thread = None
 
         self._build_ui()
         self.after(100, self._poll_queue)
@@ -679,14 +878,13 @@ class TrainTab(ttk.Frame):
             tooltip="Image size in pixels (e.g. 128 = 128x128). Higher uses more VRAM and is slower per step.",
         )
         self.batch_size = LabeledEntry(
-            settings, "Batch size", default=12,
-            tooltip="Images processed per step. Higher uses more VRAM but trains faster per epoch. "
-                    "8 is a good starting point on a 12GB Ampere card (RTX 3060) at 128px; "
-                    "lower this if you run out of memory.",
+            settings, "Batch size", default=28,
+            tooltip="Images processed per step. 16 is the practical RTX 3060 12GB sweet spot at 128px if it fits. "
+                    "Odd/non-power-of-two values like 20, 28, or 30 are allowed too, but VRAM decides if they survive.",
         )
         self.learning_rate = LabeledEntry(
-            settings, "Learning rate", default="1e-4",
-            tooltip="How fast the model updates. 1e-4 is a solid default; lower it if loss becomes unstable.",
+            settings, "Learning rate", default="2e-4",
+            tooltip="How fast the model updates. 2e-4 is a faster generalization preset; lower to 1e-4 if loss becomes unstable.",
         )
         self.mixed_precision = LabeledCombo(
             settings, "Mixed precision", values=["fp16", "bf16", "no"], default="fp16",
@@ -694,13 +892,38 @@ class TrainTab(ttk.Frame):
                     "Use 'no' only if you hit numerical issues.",
         )
         self.preview_every = LabeledEntry(
-            settings, "Preview every N epochs", default=20,
+            settings, "Preview every N epochs", default=5,
             tooltip="How often to generate a preview image and save a checkpoint during "
                     "training. Generating a preview re-runs the model's sampling process, "
                     "which costs real time on top of training itself — previewing every "
                     "epoch on a short run can roughly double total training time. "
                     "Every 5-10 epochs gives plenty of visibility without the overhead.",
         )
+        self.training_intensity = LabeledScale(
+            settings, "Training intensity", from_=10, to=100, default=75, width=180,
+            tooltip="Soft GPU throttle for background or overnight training. "
+                    "10% adds big cooldown pauses for gaming/multitasking, 50% is the quiet overnight/background zone, "
+                    "75% is serious training with small breathers, and 100% lets DDPM fully focus on training.",
+        )
+        self.training_intensity.var.trace_add("write", lambda *_: self._update_intensity_hint())
+
+        self.dataloader_workers = LabeledCombo(
+            settings, "DataLoader workers", values=["Auto", "4", "6", "8", "2", "0"], default="6", width=10,
+            tooltip="CPU image-loading workers. For your i5-10400, test 4, 6, and 8. 6 is the new default sweet spot."
+        )
+        self.gradient_accumulation = LabeledEntry(
+            settings, "Grad accumulation", default=1, width=8,
+            tooltip="Simulates a larger effective batch without extra VRAM. It can stabilize training, but usually does not make wall-clock time faster."
+        )
+        self.preview_steps = LabeledEntry(
+            settings, "Preview steps", default=50, width=8,
+            tooltip="Denoising steps used only for training preview images. Lower means previews interrupt training less; final model quality is unaffected."
+        )
+        self.preview_sampler = LabeledCombo(
+            settings, "Preview sampler", values=["DDIM", "DDPM"], default="DDIM", width=10,
+            tooltip="Sampler used only for in-training preview images. DDIM is usually faster; DDPM is the classic baseline."
+        )
+        self.pin_memory_var = tk.BooleanVar(value=True)
 
         self.epochs.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
         self.resolution.grid(row=0, column=1, sticky="ew", padx=6, pady=6)
@@ -708,10 +931,18 @@ class TrainTab(ttk.Frame):
         self.learning_rate.grid(row=1, column=0, sticky="ew", padx=6, pady=6)
         self.mixed_precision.grid(row=1, column=1, sticky="ew", padx=6, pady=6)
         self.preview_every.grid(row=1, column=2, sticky="ew", padx=6, pady=6)
+        self.training_intensity.grid(row=2, column=0, columnspan=3, sticky="ew", padx=6, pady=(8, 2))
+        self.dataloader_workers.grid(row=3, column=0, sticky="ew", padx=6, pady=6)
+        self.gradient_accumulation.grid(row=3, column=1, sticky="ew", padx=6, pady=6)
+        self.preview_steps.grid(row=3, column=2, sticky="ew", padx=6, pady=6)
+        self.preview_sampler.grid(row=4, column=0, sticky="ew", padx=6, pady=6)
+        self.intensity_hint = ttk.Label(settings, text="", style="Meta.TLabel")
+        self.intensity_hint.grid(row=5, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 6))
+        self._update_intensity_hint()
 
         # Dataset folder picker
         data_row = ttk.Frame(settings, style="Panel.TFrame")
-        data_row.grid(row=2, column=0, columnspan=3, sticky="ew", padx=6, pady=6)
+        data_row.grid(row=6, column=0, columnspan=3, sticky="ew", padx=6, pady=6)
         ttk.Label(data_row, text="Dataset folder", style="Field.TLabel").pack(anchor="w")
         picker_row = ttk.Frame(data_row, style="Panel.TFrame")
         picker_row.pack(fill="x", pady=(2, 0))
@@ -720,11 +951,51 @@ class TrainTab(ttk.Frame):
         data_entry.pack(side="left", fill="x", expand=True)
         browse_btn = ttk.Button(picker_row, text="Browse...", command=self._browse_data_dir, style="Secondary.TButton")
         browse_btn.pack(side="left", padx=(6, 0))
-        Tooltip(data_entry, "Folder containing your training images (subfolder layout: data_dir/train/*.png).")
+        Tooltip(data_entry, "Folder containing your training images. The model name can auto-fill from this folder name.")
+
+        conveyor_row = ttk.Frame(settings, style="Panel.TFrame")
+        conveyor_row.grid(row=7, column=0, columnspan=3, sticky="ew", padx=6, pady=(2, 6))
+        conveyor_row.columnconfigure(1, weight=1)
+        self.dataset_conveyor_var = tk.BooleanVar(value=False)
+        conveyor_check = ttk.Checkbutton(
+            conveyor_row, text="Dataset Conveyor Mode",
+            variable=self.dataset_conveyor_var, style="Dark.TCheckbutton",
+        )
+        conveyor_check.grid(row=0, column=0, sticky="w")
+        Tooltip(
+            conveyor_check,
+            "For huge datasets. The app splits the image paths into chunk folders, trains one chunk at a time, "
+            "and preloads the next chunk so train.py does not scan/load the entire dataset at once.",
+        )
+
+        conveyor_controls = ttk.Frame(conveyor_row, style="Panel.TFrame")
+        conveyor_controls.grid(row=0, column=1, sticky="ew", padx=(12, 0))
+        self.conveyor_chunks = LabeledEntry(
+            conveyor_controls, "Chunks", default=50, width=8,
+            tooltip="How many chunks to split the dataset into. 203,000 / 50 = about 4,060 images per chunk.",
+        )
+        self.conveyor_prefetch_var = tk.BooleanVar(value=True)
+        self.conveyor_chunks.pack(side="left", padx=(0, 10))
+        prefetch_check = ttk.Checkbutton(
+            conveyor_controls, text="Prefetch next chunk",
+            variable=self.conveyor_prefetch_var, style="Dark.TCheckbutton",
+        )
+        prefetch_check.pack(side="left", pady=(18, 0))
+        Tooltip(prefetch_check, "Keeps the next chunk ready while the current chunk trains. Uses disk links/copies, not full image RAM loading.")
+
+        name_row = ttk.Frame(settings, style="Panel.TFrame")
+        name_row.grid(row=8, column=0, columnspan=3, sticky="ew", padx=6, pady=(2, 6))
+        name_row.columnconfigure(1, weight=1)
+        ttk.Label(name_row, text="Model name", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.model_name_var = tk.StringVar(value=self._suggest_model_name(DEFAULT_DATA_DIR))
+        name_entry = ttk.Entry(name_row, textvariable=self.model_name_var, style="Field.TEntry")
+        name_entry.grid(row=0, column=1, sticky="ew")
+        ttk.Button(name_row, text="Use Dataset Name", command=self._use_dataset_name, style="Secondary.TButton").grid(row=0, column=2, padx=(6, 0))
+        Tooltip(name_entry, "Friendly name saved inside model_info.json. Used by the library and per-model Generations folders.")
 
         # Model loading / output saving
         model_row = ttk.Frame(settings, style="Panel.TFrame")
-        model_row.grid(row=3, column=0, columnspan=3, sticky="ew", padx=6, pady=(8, 2))
+        model_row.grid(row=9, column=0, columnspan=3, sticky="ew", padx=6, pady=(8, 2))
         model_row.columnconfigure(1, weight=1)
         ttk.Label(model_row, text="Start from trained model", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.base_model_var = tk.StringVar(value="")
@@ -735,7 +1006,7 @@ class TrainTab(ttk.Frame):
         Tooltip(base_entry, "Optional: pick an older trained DDPMPipeline folder to continue/fine-tune from. Leave blank to train from scratch.")
 
         out_row = ttk.Frame(settings, style="Panel.TFrame")
-        out_row.grid(row=4, column=0, columnspan=3, sticky="ew", padx=6, pady=(2, 6))
+        out_row.grid(row=10, column=0, columnspan=3, sticky="ew", padx=6, pady=(2, 6))
         out_row.columnconfigure(1, weight=1)
         ttk.Label(out_row, text="Save training to", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.output_dir_var = tk.StringVar(value=str(DEFAULT_OUTPUT_DIR))
@@ -764,6 +1035,17 @@ class TrainTab(ttk.Frame):
             storage_check,
             "Recommended. Saves only the Generate-ready DDPM pipeline and removes heavy "
             "checkpoint/log training artifacts that can turn one model into 100+ GB.",
+        )
+
+        pin_check = ttk.Checkbutton(
+            adv_row, text="Pin Memory (faster RAM → GPU transfer)",
+            variable=self.pin_memory_var, style="Dark.TCheckbutton",
+        )
+        pin_check.pack(side="left", padx=(16, 0))
+        Tooltip(
+            pin_check,
+            "Recommended for CUDA training. Locks staging RAM so batches move to VRAM faster. "
+            "Turn off only if it causes system stutter."
         )
 
         # Start/stop controls
@@ -827,10 +1109,47 @@ class TrainTab(ttk.Frame):
         self.preview_label.pack(fill="both", expand=True)
         self.log_text.configure(state=tk.DISABLED)
 
+    def _get_intensity_description(self, intensity=None):
+        intensity = int(intensity if intensity is not None else self.training_intensity.get())
+        if intensity <= 20:
+            return "10% Power — heavy cooldown pauses for gaming or extreme multitasking."
+        if intensity <= 60:
+            return "50% Balanced — good for overnight/background training without the fan goblin screaming."
+        if intensity <= 85:
+            return "75% Serious — trains hard, with small breathers so the PC stays usable."
+        return "100% Full Send — DDPM gets the GPU and your fans get the microphone."
+
+    def _update_intensity_hint(self):
+        if hasattr(self, "intensity_hint"):
+            self.intensity_hint.config(text=self._get_intensity_description())
+
+    def _worker_count_for_intensity(self, intensity):
+        intensity = int(intensity)
+        if intensity <= 20:
+            return 1
+        if intensity <= 60:
+            return 2
+        if intensity <= 85:
+            return 4
+        return 6
+
+    def _suggest_model_name(self, data_dir):
+        name = Path(data_dir).expanduser().name or "DDPM Model"
+        if name.lower() == "train" and Path(data_dir).parent.name:
+            name = Path(data_dir).parent.name
+        return sanitize_filename_component(name, fallback="DDPM Model")
+
+    def _use_dataset_name(self):
+        self.model_name_var.set(self._suggest_model_name(self.data_dir_var.get()))
+
     def _browse_data_dir(self):
+        old_suggestion = self._suggest_model_name(self.data_dir_var.get())
         chosen = filedialog.askdirectory(initialdir=self.data_dir_var.get() or str(ROOT_DIR))
         if chosen:
             self.data_dir_var.set(chosen)
+            current_name = self.model_name_var.get().strip()
+            if not current_name or current_name == old_suggestion:
+                self.model_name_var.set(self._suggest_model_name(chosen))
 
     def _browse_base_model(self):
         chosen = filedialog.askdirectory(initialdir=str(DEFAULT_MODELS_ROOT if DEFAULT_MODELS_ROOT.exists() else ROOT_DIR))
@@ -947,15 +1266,74 @@ class TrainTab(ttk.Frame):
             errors.append("Preview every N epochs must be a whole number (e.g. 5).")
             preview_every = None
 
+        conveyor_enabled = bool(getattr(self, "dataset_conveyor_var", tk.BooleanVar(value=False)).get())
+        try:
+            conveyor_chunks = int(self.conveyor_chunks.get()) if conveyor_enabled else 1
+            if conveyor_enabled and conveyor_chunks <= 0:
+                errors.append("Dataset Conveyor chunks must be a positive whole number.")
+        except ValueError:
+            errors.append("Dataset Conveyor chunks must be a whole number, like 50.")
+            conveyor_chunks = 1
+
+        intensity = int(self.training_intensity.get())
+        intensity = max(10, min(100, intensity))
+
+        workers_raw = self.dataloader_workers.get().strip()
+        if workers_raw.lower() == "auto" or workers_raw == "":
+            dataloader_workers = None
+        else:
+            try:
+                dataloader_workers = int(workers_raw)
+                if dataloader_workers < 0:
+                    errors.append("DataLoader workers must be zero or a positive whole number.")
+            except ValueError:
+                errors.append("DataLoader workers must be 'Auto' or a whole number (e.g. 6).")
+                dataloader_workers = None
+
+        try:
+            gradient_accumulation = int(self.gradient_accumulation.get())
+            if gradient_accumulation <= 0:
+                errors.append("Grad accumulation must be a positive whole number.")
+        except ValueError:
+            errors.append("Grad accumulation must be a whole number (e.g. 1).")
+            gradient_accumulation = 1
+
+        try:
+            preview_steps = int(self.preview_steps.get())
+            if preview_steps <= 0:
+                errors.append("Preview steps must be a positive whole number.")
+        except ValueError:
+            errors.append("Preview steps must be a whole number (e.g. 50).")
+            preview_steps = 50
+
         data_dir = Path(self.data_dir_var.get())
         if not data_dir.exists():
             errors.append(f"Dataset folder does not exist: {data_dir}")
 
+        raw_model_name = self.model_name_var.get().strip() or self._suggest_model_name(data_dir)
+        model_name = sanitize_filename_component(raw_model_name, fallback="DDPM Model")
+        if model_name != raw_model_name:
+            self.model_name_var.set(model_name)
+
         output_dir = Path(self.output_dir_var.get()).expanduser()
         if not output_dir:
             errors.append("Pick an output folder to save the trained model.")
-
         base_model = self.base_model_var.get().strip()
+        should_auto_pick_folder = output_dir.resolve() == DEFAULT_OUTPUT_DIR.resolve()
+        try:
+            under_default_output = output_dir.parent.resolve() == DEFAULT_MODELS_ROOT.resolve()
+        except OSError:
+            under_default_output = False
+        if under_default_output and output_dir.exists() and any(output_dir.iterdir()) and not base_model:
+            # Collision handling: Test -> Test 1 -> Test 2, etc.
+            should_auto_pick_folder = True
+        if should_auto_pick_folder:
+            # Default output/model is too easy to overwrite. When the user leaves it
+            # at default, or a same-name model already exists, create output/<Model Name>,
+            # output/<Model Name 1>, etc.
+            output_dir = unique_child_dir(DEFAULT_MODELS_ROOT, model_name)
+            self.output_dir_var.set(str(output_dir))
+
         if base_model:
             resolved_base = find_loadable_model_inside(Path(base_model))
             if resolved_base is None:
@@ -975,9 +1353,19 @@ class TrainTab(ttk.Frame):
             "preview_every": preview_every,
             "data_dir": str(data_dir),
             "output_dir": str(output_dir),
+            "model_name": model_name,
             "base_model": base_model,
             "use_ema": self.use_ema_var.get(),
             "storage_saver": self.storage_saver_var.get(),
+            "training_intensity": intensity,
+            "dataloader_workers": dataloader_workers if dataloader_workers is not None else self._worker_count_for_intensity(intensity),
+            "gradient_accumulation_steps": gradient_accumulation,
+            "preview_steps": preview_steps,
+            "preview_sampler": self.preview_sampler.get(),
+            "pin_memory": bool(self.pin_memory_var.get()),
+            "dataset_conveyor": conveyor_enabled,
+            "conveyor_chunks": conveyor_chunks,
+            "conveyor_prefetch": bool(getattr(self, "conveyor_prefetch_var", tk.BooleanVar(value=True)).get()),
         }, []
 
     # -- Process control --------------------------------------------------
@@ -997,18 +1385,56 @@ class TrainTab(ttk.Frame):
         except FileNotFoundError:
             pass
 
+        self.training_active = True
+        self.start_time = time.time()
+        self.user_stopped = False
+        self.start_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self.progress_bar.config(value=0, maximum=100)
+        self.last_saved_model_dir = str(output_dir)
+        self.save_btn.config(state=tk.DISABLED)
+        self.preview_label.config(image="", text="Scanning dataset...")
+        self._clear_log()
+        self.app.set_training_active(True)
+
+        if settings.get("dataset_conveyor"):
+            try:
+                self._start_conveyor_training(settings, output_dir)
+            except Exception as exc:
+                self._append_log(f"Dataset Conveyor failed to start: {exc}")
+                messagebox.showerror("Dataset Conveyor failed", str(exc))
+                self._finish_training(success=False)
+            return
+
+        cmd = self._build_training_command(
+            settings=settings,
+            train_data_dir=settings["data_dir"],
+            output_dir=output_dir,
+            num_epochs=settings["epochs"],
+            base_model=settings.get("base_model") or "",
+        )
+        self.status_label.config(text=f"Starting... {self._get_intensity_description(settings['training_intensity'])}")
+        self._launch_training_command(cmd)
+
+    def _build_training_command(self, settings, train_data_dir, output_dir, num_epochs, base_model=""):
         cmd = [
             sys.executable, str(TRAIN_SCRIPT),
-            "--train_data_dir", settings["data_dir"],
+            "--train_data_dir", str(train_data_dir),
             "--output_dir", str(output_dir),
+            "--model_name", settings["model_name"],
             "--resolution", str(settings["resolution"]),
             "--train_batch_size", str(settings["batch_size"]),
-            "--num_epochs", str(settings["epochs"]),
+            "--num_epochs", str(num_epochs),
             "--learning_rate", str(settings["learning_rate"]),
             "--mixed_precision", settings["mixed_precision"],
-            "--save_images_epochs", str(settings["preview_every"]),
-            "--save_model_epochs", str(settings["preview_every"]),
-            "--dataloader_num_workers", "4",
+            "--save_images_epochs", str(settings.get("save_images_epochs", settings["preview_every"])),
+            "--save_model_epochs", str(settings.get("save_model_epochs", settings["preview_every"])),
+            "--training_intensity", str(settings["training_intensity"]),
+            "--dataloader_num_workers", str(settings["dataloader_workers"]),
+            "--gradient_accumulation_steps", str(settings.get("gradient_accumulation_steps", 1)),
+            "--preview_num_inference_steps", str(settings.get("preview_steps", 50)),
+            "--preview_sampler", str(settings.get("preview_sampler", "DDIM")),
+            "--pin_memory", "true" if settings.get("pin_memory", True) else "false",
             "--stop_signal_file", str(self.stop_signal_file),
             "--gui_progress",
         ]
@@ -1019,18 +1445,18 @@ class TrainTab(ttk.Frame):
                 "--checkpoints_total_limit", "0",
             ])
         else:
-            # Advanced/experimental: keep only a tiny number of exact-resume checkpoints.
-            # This can still consume multiple GB, but it will not grow forever.
             cmd.extend([
                 "--storage_saver", "false",
                 "--checkpointing_steps", "1000",
                 "--checkpoints_total_limit", "2",
             ])
-        if settings["base_model"]:
-            cmd.extend(["--pretrained_model_path", settings["base_model"]])
+        if base_model:
+            cmd.extend(["--pretrained_model_path", str(base_model)])
         if settings["use_ema"]:
             cmd.append("--use_ema")
+        return cmd
 
+    def _launch_training_command(self, cmd):
         try:
             self.proc = subprocess.Popen(
                 cmd,
@@ -1042,23 +1468,188 @@ class TrainTab(ttk.Frame):
             )
         except OSError as e:
             messagebox.showerror("Couldn't start training", str(e))
-            return
-
-        self.training_active = True
-        self.start_time = time.time()
-        self.user_stopped = False
-        self.start_btn.config(state=tk.DISABLED)
-        self.stop_btn.config(state=tk.NORMAL)
-        self.status_label.config(text="Starting...")
-        self.progress_bar.config(value=0, maximum=100)
-        self.last_saved_model_dir = str(output_dir)
-        self.save_btn.config(state=tk.DISABLED)
-        self.preview_label.config(image="", text="Scanning dataset...")
-        self._clear_log()
-        self.app.set_training_active(True)
+            self._finish_training(success=False)
+            return False
 
         self.reader_thread = threading.Thread(target=self._read_process_output, daemon=True)
         self.reader_thread.start()
+        return True
+
+    def _scan_training_images(self, data_dir: Path):
+        paths = []
+        for file_path in Path(data_dir).expanduser().rglob("*"):
+            if file_path.is_file() and file_path.suffix.lower() in IMAGE_EXTENSIONS:
+                paths.append(file_path)
+        paths.sort()
+        return paths
+
+    def _split_paths_into_chunks(self, paths, chunk_count):
+        if not paths:
+            return []
+        chunk_count = max(1, min(int(chunk_count), len(paths)))
+        chunk_size = max(1, (len(paths) + chunk_count - 1) // chunk_count)
+        return [paths[i:i + chunk_size] for i in range(0, len(paths), chunk_size)]
+
+    def _link_or_copy_image(self, src: Path, dst: Path):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists():
+            return
+        try:
+            os.link(src, dst)
+        except Exception:
+            try:
+                os.symlink(src, dst)
+            except Exception:
+                shutil.copy2(src, dst)
+
+    def _prepare_conveyor_chunk(self, chunk_index):
+        state = self.conveyor_state
+        if not state:
+            return None
+        prepared = state.setdefault("prepared_chunks", {})
+        if chunk_index in prepared:
+            return prepared[chunk_index]
+        chunks = state["chunks"]
+        if chunk_index < 0 or chunk_index >= len(chunks):
+            return None
+
+        chunk_dir = state["work_dir"] / f"chunk_{chunk_index + 1:04d}"
+        if chunk_dir.exists():
+            shutil.rmtree(chunk_dir, ignore_errors=True)
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+
+        for local_index, src in enumerate(chunks[chunk_index]):
+            # Prefix with an index to avoid filename collisions from nested folders.
+            safe_name = f"{local_index:06d}_{sanitize_filename_component(src.stem, 'image')}{src.suffix.lower()}"
+            self._link_or_copy_image(src, chunk_dir / safe_name)
+        prepared[chunk_index] = chunk_dir
+        return chunk_dir
+
+    def _prefetch_conveyor_chunk(self, chunk_index):
+        if not self.conveyor_state or not self.conveyor_state.get("prefetch"):
+            return
+        if chunk_index >= len(self.conveyor_state.get("chunks", [])):
+            return
+        if self.conveyor_prefetch_thread and self.conveyor_prefetch_thread.is_alive():
+            return
+        def work():
+            try:
+                self._prepare_conveyor_chunk(chunk_index)
+            except Exception as exc:
+                self.event_queue.put(("log", f"Dataset Conveyor prefetch failed for chunk {chunk_index + 1}: {exc}"))
+        self.conveyor_prefetch_thread = threading.Thread(target=work, daemon=True)
+        self.conveyor_prefetch_thread.start()
+
+    def _cleanup_old_conveyor_chunks(self):
+        state = self.conveyor_state
+        if not state:
+            return
+        current = state.get("chunk_index", 0)
+        prepared = state.setdefault("prepared_chunks", {})
+        for idx in list(prepared.keys()):
+            if idx < current - 1:
+                shutil.rmtree(prepared[idx], ignore_errors=True)
+                prepared.pop(idx, None)
+
+    def _start_conveyor_training(self, settings, output_dir: Path):
+        image_paths = self._scan_training_images(Path(settings["data_dir"]))
+        if not image_paths:
+            raise RuntimeError("No usable images were found for Dataset Conveyor Mode.")
+        random.shuffle(image_paths)
+        chunks = self._split_paths_into_chunks(image_paths, settings["conveyor_chunks"])
+        work_dir = output_dir / "_dataset_conveyor_cache"
+        if work_dir.exists():
+            shutil.rmtree(work_dir, ignore_errors=True)
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        self.conveyor_state = {
+            "settings": settings,
+            "output_dir": output_dir,
+            "work_dir": work_dir,
+            "chunks": chunks,
+            "pass_index": 0,
+            "chunk_index": 0,
+            "total_passes": int(settings["epochs"]),
+            "prefetch": bool(settings.get("conveyor_prefetch", True)),
+            "prepared_chunks": {},
+            "base_model": settings.get("base_model") or "",
+        }
+        chunk_size = len(chunks[0]) if chunks else 0
+        self._append_log(
+            f"Dataset Conveyor enabled: {len(image_paths)} image(s) split into {len(chunks)} chunk(s), "
+            f"about {chunk_size} image(s) per chunk. Epochs now mean full conveyor passes."
+        )
+        self._append_log("Preparing chunk 1 before training starts...")
+        self._prepare_conveyor_chunk(0)
+        self._prefetch_conveyor_chunk(1)
+        self._run_current_conveyor_chunk()
+
+    def _run_current_conveyor_chunk(self):
+        state = self.conveyor_state
+        if not state:
+            return False
+        settings = dict(state["settings"])
+        # Conveyor mode needs the model saved after every chunk so the next
+        # subprocess can continue from the newly trained output. Keep preview
+        # frequency independent so it does not generate a preview after every
+        # small chunk unless the user asked for that.
+        settings["save_model_epochs"] = 1
+        settings["save_images_epochs"] = state["settings"].get("preview_every", 1)
+        output_dir = state["output_dir"]
+        chunk_index = state["chunk_index"]
+        pass_index = state["pass_index"]
+        total_chunks = len(state["chunks"])
+        total_passes = state["total_passes"]
+
+        # Shuffle the chunk order after the first pass so the model does not see
+        # the same conveyor order forever.
+        if chunk_index == 0 and pass_index > 0:
+            random.shuffle(state["chunks"])
+            state["prepared_chunks"].clear()
+
+        chunk_dir = self._prepare_conveyor_chunk(chunk_index)
+        self._prefetch_conveyor_chunk(chunk_index + 1)
+        self._cleanup_old_conveyor_chunks()
+        base_model = state["base_model"] if (pass_index == 0 and chunk_index == 0) else str(output_dir)
+        cmd = self._build_training_command(
+            settings=settings,
+            train_data_dir=chunk_dir,
+            output_dir=output_dir,
+            num_epochs=1,
+            base_model=base_model,
+        )
+        self.status_label.config(
+            text=f"Dataset Conveyor: pass {pass_index + 1}/{total_passes}, chunk {chunk_index + 1}/{total_chunks}..."
+        )
+        self._append_log(f"Training conveyor chunk {chunk_index + 1}/{total_chunks} for pass {pass_index + 1}/{total_passes}.")
+        return self._launch_training_command(cmd)
+
+    def _advance_conveyor_or_finish(self):
+        state = self.conveyor_state
+        if not state:
+            self.status_label.config(text="Training complete!")
+            self._finish_training(success=True)
+            return
+
+        if self.user_stopped:
+            self.status_label.config(text="Training stopped.")
+            self._finish_training(success=False)
+            return
+
+        state["chunk_index"] += 1
+        if state["chunk_index"] >= len(state["chunks"]):
+            state["chunk_index"] = 0
+            state["pass_index"] += 1
+            self._append_log(f"Dataset Conveyor pass {state['pass_index']}/{state['total_passes']} finished.")
+
+        if state["pass_index"] >= state["total_passes"]:
+            self.status_label.config(text="Dataset Conveyor training complete!")
+            self.progress_bar.config(value=100)
+            self.eta_label.config(text="Done")
+            self._finish_training(success=True)
+            return
+
+        self._run_current_conveyor_chunk()
 
     def _on_stop(self):
         if self.proc is not None and self.training_active:
@@ -1112,11 +1703,20 @@ class TrainTab(ttk.Frame):
             total = evt.get("total_files", 0)
             self._append_log(f"Dataset scan: {usable} usable image(s) out of {total} file(s).")
             self._show_dataset_examples(evt.get("example_images") or [])
+        elif kind == "hardware_warning":
+            message = evt.get("message") or CUDA_CPU_WARNING_MESSAGE
+            self._append_log(f"WARNING: {message}")
+            self.status_label.config(text="CUDA unavailable — training will run on CPU and may be extremely slow.")
+            details = evt.get("details")
+            if details:
+                self._append_log(details)
         elif kind == "start":
             total_epochs = evt.get("num_epochs", "?")
             self.total_epochs = evt.get("num_epochs")
-            self.status_label.config(text=f"Training started ({total_epochs} epochs)...")
+            intensity = evt.get("training_intensity", "?")
+            self.status_label.config(text=f"Training started ({total_epochs} epochs) at {intensity}% intensity...")
             self.epoch_label.config(text=f"Epoch: 0 / {total_epochs}")
+            self._append_log(f"Training intensity: {intensity}% | GPU breather sleep ratio: {evt.get('throttle_sleep_ratio', 0):.2f}x step time")
         elif kind == "step":
             total_steps = evt.get("total_steps") or 1
             step = evt.get("global_step", 0)
@@ -1151,19 +1751,25 @@ class TrainTab(ttk.Frame):
                 self.last_saved_model_dir = out
                 self.save_btn.config(state=tk.NORMAL)
                 size = evt.get("size_human")
+                model_name = evt.get("model_name")
                 if size:
                     self._append_log(f"Saved lightweight loadable model to: {out}  ({size})")
                 else:
                     self._append_log(f"Saved loadable model to: {out}")
+                if model_name:
+                    self._append_log(f"Model name: {model_name}")
         elif kind == "stopped":
             self.status_label.config(text="Training stopped and saved.")
             self.eta_label.config(text="Stopped")
             self._finish_training(success=True)
         elif kind == "done":
-            self.status_label.config(text="Training complete!", )
-            self.progress_bar.config(value=100)
-            self.eta_label.config(text="Done")
-            self._finish_training(success=True)
+            if self.conveyor_state:
+                self.status_label.config(text="Dataset Conveyor chunk finished; preparing next chunk...")
+            else:
+                self.status_label.config(text="Training complete!", )
+                self.progress_bar.config(value=100)
+                self.eta_label.config(text="Done")
+                self._finish_training(success=True)
         elif kind == "error":
             self._append_log(f"ERROR: {evt.get('message', 'unknown error')}")
 
@@ -1171,8 +1777,7 @@ class TrainTab(ttk.Frame):
         if not self.training_active:
             return  # already handled via the "done" event
         if returncode == 0:
-            self.status_label.config(text="Training complete!")
-            self._finish_training(success=True)
+            self._advance_conveyor_or_finish()
         elif self.user_stopped:
             self.status_label.config(text="Training stopped.")
             self._finish_training(success=False)
@@ -1181,6 +1786,11 @@ class TrainTab(ttk.Frame):
             self._finish_training(success=False)
 
     def _finish_training(self, success):
+        if self.conveyor_state:
+            work_dir = self.conveyor_state.get("work_dir")
+            if work_dir and success:
+                shutil.rmtree(work_dir, ignore_errors=True)
+            self.conveyor_state = None
         self.training_active = False
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
@@ -1230,17 +1840,19 @@ class GenerateTab(ttk.Frame):
 
         self.model_tree = ttk.Treeview(
             library,
-            columns=("resolution", "modified", "path"),
+            columns=("name", "resolution", "modified", "path"),
             show="headings",
             height=6,
             selectmode="browse",
         )
+        self.model_tree.heading("name", text="Model name")
         self.model_tree.heading("resolution", text="Resolution")
         self.model_tree.heading("modified", text="Modified")
         self.model_tree.heading("path", text="Model folder")
+        self.model_tree.column("name", width=180, stretch=False)
         self.model_tree.column("resolution", width=90, stretch=False)
         self.model_tree.column("modified", width=135, stretch=False)
-        self.model_tree.column("path", width=420, stretch=True)
+        self.model_tree.column("path", width=340, stretch=True)
         self.model_tree.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
         self.model_tree.bind("<<TreeviewSelect>>", self._on_model_tree_select)
         self.model_tree.bind("<Double-1>", lambda _e: self._load_selected_tree_model())
@@ -1259,8 +1871,68 @@ class GenerateTab(ttk.Frame):
         main.columnconfigure(1, weight=1)
         main.rowconfigure(1, weight=1)
 
-        controls = ttk.Frame(main, style="Card.TFrame")
-        controls.grid(row=0, column=0, rowspan=2, sticky="ns", padx=(0, 12), pady=(0, 16))
+        # The image generation controls can be taller than the visible window,
+        # especially on smaller monitors or with Windows display scaling.
+        # Put the control panel inside a scrollable canvas so the Save button
+        # can no longer sneak below the bottom of the app like cursed UI archaeology.
+        controls_outer = ttk.Frame(main, style="Card.TFrame")
+        controls_outer.grid(row=0, column=0, rowspan=2, sticky="ns", padx=(0, 12), pady=(0, 16))
+        controls_outer.rowconfigure(0, weight=1)
+        controls_outer.columnconfigure(0, weight=1)
+
+        self.image_controls_canvas = tk.Canvas(
+            controls_outer,
+            bg=BG_PANEL,
+            highlightthickness=0,
+            bd=0,
+            width=260,
+        )
+        self.image_controls_scrollbar = ttk.Scrollbar(
+            controls_outer,
+            orient="vertical",
+            command=self.image_controls_canvas.yview,
+        )
+        self.image_controls_canvas.configure(yscrollcommand=self.image_controls_scrollbar.set)
+
+        self.image_controls_canvas.grid(row=0, column=0, sticky="ns")
+        self.image_controls_scrollbar.grid(row=0, column=1, sticky="ns")
+
+        controls = ttk.Frame(self.image_controls_canvas, style="Card.TFrame")
+        self.image_controls_window = self.image_controls_canvas.create_window(
+            (0, 0), window=controls, anchor="nw"
+        )
+
+        def _sync_image_controls_scrollregion(_event=None):
+            self.image_controls_canvas.configure(scrollregion=self.image_controls_canvas.bbox("all"))
+
+        def _sync_image_controls_width(event):
+            # Keep the inner ttk.Frame the same width as the canvas viewport.
+            self.image_controls_canvas.itemconfigure(self.image_controls_window, width=event.width)
+
+        def _wheel_image_controls(event):
+            if getattr(event, "num", None) == 4:
+                self.image_controls_canvas.yview_scroll(-1, "units")
+            elif getattr(event, "num", None) == 5:
+                self.image_controls_canvas.yview_scroll(1, "units")
+            else:
+                delta = -1 * int(event.delta / 120) if event.delta else 0
+                self.image_controls_canvas.yview_scroll(delta, "units")
+            return "break"
+
+        def _bind_image_controls_wheel(_event=None):
+            self.image_controls_canvas.bind_all("<MouseWheel>", _wheel_image_controls)
+            self.image_controls_canvas.bind_all("<Button-4>", _wheel_image_controls)
+            self.image_controls_canvas.bind_all("<Button-5>", _wheel_image_controls)
+
+        def _unbind_image_controls_wheel(_event=None):
+            self.image_controls_canvas.unbind_all("<MouseWheel>")
+            self.image_controls_canvas.unbind_all("<Button-4>")
+            self.image_controls_canvas.unbind_all("<Button-5>")
+
+        controls.bind("<Configure>", _sync_image_controls_scrollregion)
+        self.image_controls_canvas.bind("<Configure>", _sync_image_controls_width)
+        controls_outer.bind("<Enter>", _bind_image_controls_wheel)
+        controls_outer.bind("<Leave>", _unbind_image_controls_wheel)
 
         ttk.Label(controls, text="Generation Controls", style="Meta.TLabel").pack(anchor="w", padx=12, pady=(12, 8))
         self.selected_model_label = ttk.Label(controls, text="Selected: --", style="Meta.TLabel", wraplength=240, justify="left")
@@ -1274,10 +1946,23 @@ class GenerateTab(ttk.Frame):
         self.preset.var.trace_add("write", lambda *_: self._apply_preset())
 
         self.steps = LabeledScale(
-            controls, "Inference steps", from_=10, to=250, default=75,
+            controls, "Inference steps", from_=10, to=350, default=75,
             tooltip="More steps usually means cleaner/more settled images, but slower generation."
         )
         self.steps.pack(fill="x", padx=12, pady=6)
+
+        self.sampler = LabeledCombo(
+            controls, "Sampler", values=["DDPM", "DDIM"], default="DDIM", width=10,
+            tooltip=(
+                "DDPM: classic slower sampler, very stable baseline. "
+                "DDIM: faster sampler that usually works well at lower step counts and is great for quick dream previews."
+            )
+        )
+        self.sampler.pack(fill="x", padx=12, pady=6)
+        self.sampler.var.trace_add("write", lambda *_: self._update_sampler_hint())
+        self.sampler_hint = ttk.Label(controls, text="", style="Meta.TLabel", wraplength=240, justify="left")
+        self.sampler_hint.pack(fill="x", padx=12, pady=(0, 4))
+        self._update_sampler_hint()
 
         self.batch_count = LabeledCombo(
             controls, "Images", values=["1", "2", "4", "8"], default="1", width=8,
@@ -1301,7 +1986,7 @@ class GenerateTab(ttk.Frame):
         out_frame = ttk.Frame(controls, style="Card.TFrame")
         out_frame.pack(fill="x", padx=12, pady=(8, 4))
         ttk.Label(out_frame, text="Save generated images to", style="Meta.TLabel").pack(anchor="w")
-        self.image_output_dir_var = tk.StringVar(value=str(ROOT_DIR / "output" / "generations"))
+        self.image_output_dir_var = tk.StringVar(value=str(DEFAULT_GENERATIONS_DIR))
         ttk.Entry(out_frame, textvariable=self.image_output_dir_var, width=24, style="Field.TEntry").pack(anchor="w", fill="x", pady=(2, 0))
         ttk.Button(out_frame, text="Browse...", command=self._browse_image_output_dir, style="Secondary.TButton").pack(anchor="w", pady=(6, 0))
 
@@ -1331,13 +2016,13 @@ class GenerateTab(ttk.Frame):
             key = f"model_{idx}"
             self._checkpoint_paths[key] = path
             self._model_infos[key] = info
-            self.model_tree.insert("", "end", iid=key, values=(info["resolution"], info["modified"], info["display"]))
+            self.model_tree.insert("", "end", iid=key, values=(info["model_name"], info["resolution"], info["modified"], info["display"]))
 
         if not checkpoints:
             key = "pretrained_demo"
             self._checkpoint_paths[key] = PRETRAINED_MODEL
-            self._model_infos[key] = {"display": "Pretrained demo model", "resolution": "128x128", "modified": "online", "path": PRETRAINED_MODEL}
-            self.model_tree.insert("", "end", iid=key, values=("128x128", "online", "Pretrained demo model"))
+            self._model_infos[key] = {"model_name": "Pretrained demo", "display": "Pretrained demo model", "resolution": "128x128", "modified": "online", "path": PRETRAINED_MODEL}
+            self.model_tree.insert("", "end", iid=key, values=("Pretrained demo", "128x128", "online", "Pretrained demo model"))
 
         # Keep previous selection when possible.
         target_key = None
@@ -1379,7 +2064,7 @@ class GenerateTab(ttk.Frame):
             return
         self.last_model_path = path
         info = self._model_infos.get(self.get_selected_model_key(), {})
-        self.gen_status_label.config(text=f"Ready to generate with: {info.get('display', path)}")
+        self.gen_status_label.config(text=f"Ready to generate with: {info.get('model_name', info.get('display', path))}")
 
     def _browse_model(self):
         chosen = filedialog.askdirectory(initialdir=str(DEFAULT_MODELS_ROOT if DEFAULT_MODELS_ROOT.exists() else ROOT_DIR))
@@ -1398,7 +2083,7 @@ class GenerateTab(ttk.Frame):
         self._checkpoint_paths[key] = str(resolved)
         self._model_infos[key] = info
         if key not in self.model_tree.get_children():
-            self.model_tree.insert("", 0, iid=key, values=(info["resolution"], info["modified"], info["display"]))
+            self.model_tree.insert("", 0, iid=key, values=(info["model_name"], info["resolution"], info["modified"], info["display"]))
         self.model_tree.selection_set(key)
         self.model_tree.focus(key)
         self._on_model_tree_select()
@@ -1434,12 +2119,16 @@ class GenerateTab(ttk.Frame):
         self.gen_status_label.config(text=f"Saved selected model to: {dst}")
 
     def _browse_image_output_dir(self):
-        chosen = filedialog.askdirectory(initialdir=self.image_output_dir_var.get() or str(ROOT_DIR))
+        chosen = filedialog.askdirectory(initialdir=self.image_output_dir_var.get() or str(DEFAULT_GENERATIONS_DIR))
         if chosen:
             self.image_output_dir_var.set(chosen)
 
     def _randomize_seed(self):
         self.seed_var.set(str(random.randint(0, 2_147_483_647)))
+
+    def _update_sampler_hint(self):
+        sampler = self.sampler.get() if hasattr(self, "sampler") else "DDPM"
+        self.sampler_hint.config(text=SAMPLER_DESCRIPTIONS.get(sampler, SAMPLER_DESCRIPTIONS["DDPM"]))
 
     def _apply_preset(self):
         preset = self.preset.get()
@@ -1475,6 +2164,7 @@ class GenerateTab(ttk.Frame):
             "model_path": model_path,
             "seed": seed,
             "steps": steps,
+            "sampler": self.sampler.get(),
             "batch_count": batch_count,
             "preview_size": preview_size,
         }
@@ -1485,7 +2175,7 @@ class GenerateTab(ttk.Frame):
             return
 
         self.generate_btn.config(state=tk.DISABLED)
-        self.gen_status_label.config(text=f"Generating {settings['batch_count']} image(s) at {settings['steps']} steps...")
+        self.gen_status_label.config(text=f"Generating {settings['batch_count']} image(s) with {settings['sampler']} at {settings['steps']} steps...")
 
         def work():
             try:
@@ -1494,6 +2184,7 @@ class GenerateTab(ttk.Frame):
                     seed=settings["seed"],
                     num_inference_steps=settings["steps"],
                     batch_size=settings["batch_count"],
+                    sampler=settings["sampler"],
                 )
                 from PIL import Image as PILImage, ImageTk
 
@@ -1538,16 +2229,28 @@ class GenerateTab(ttk.Frame):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _get_active_model_info_for_generations(self):
+        model_path = self.last_model_path or self.get_selected_model_path()
+        for key, path in self._checkpoint_paths.items():
+            if path == model_path:
+                return self._model_infos.get(key, {})
+        if model_path and model_path != PRETRAINED_MODEL:
+            return get_model_info(Path(model_path))
+        return {"model_name": "Pretrained demo"}
+
     def _save_last_images(self):
         if not self.last_images:
             messagebox.showerror("No images yet", "Generate an image first.")
             return
-        out_dir = Path(self.image_output_dir_var.get()).expanduser()
+        root_out_dir = Path(self.image_output_dir_var.get()).expanduser()
+        model_info = self._get_active_model_info_for_generations()
+        model_name = sanitize_filename_component(model_info.get("model_name") or model_info.get("name") or "Model")
+        out_dir = root_out_dir / f"{model_name} Generations"
         out_dir.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
         saved = []
         for idx, img in enumerate(self.last_images, start=1):
-            path = out_dir / f"generation_{stamp}_{idx:02d}.png"
+            path = out_dir / f"{model_name}_generation_{stamp}_{idx:02d}.png"
             img.save(path)
             saved.append(path)
         self.gen_status_label.config(text=f"Saved {len(saved)} image(s) to: {out_dir}")
@@ -1629,10 +2332,24 @@ class VideoTab(ttk.Frame):
         self.video_smoothness.pack(fill="x", padx=12, pady=6)
 
         self.reference_influence = LabeledScale(
-            controls, "Reference influence", from_=0, to=100, default=60,
-            tooltip="How strongly the reference video frame structure is preserved. 0 ignores the reference video."
+            controls, "Reference influence", from_=0, to=100, default=70,
+            tooltip="How close the DDPM denoising starts to the reference frame. Higher values preserve more structure."
         )
         self.reference_influence.pack(fill="x", padx=12, pady=6)
+
+        self.reference_mode = LabeledCombo(
+            controls, "Reference mode",
+            values=["Dreamify/Reconstruct", "Reimagine Shape"],
+            default="Dreamify/Reconstruct", width=20,
+            tooltip="Dreamify/Reconstruct keeps the source frame visible, APVD-style. Reimagine Shape is the older troll-face/object-morph style."
+        )
+        self.reference_mode.pack(fill="x", padx=12, pady=6)
+
+        self.source_preservation = LabeledScale(
+            controls, "Source preservation", from_=0, to=100, default=55,
+            tooltip="Only used in Dreamify/Reconstruct mode. Higher keeps more of the original frame; lower lets DDPM dream harder."
+        )
+        self.source_preservation.pack(fill="x", padx=12, pady=6)
 
         seed_wrap = ttk.Frame(controls, style="Card.TFrame")
         seed_wrap.pack(fill="x", padx=12, pady=6)
@@ -1668,7 +2385,7 @@ class VideoTab(ttk.Frame):
         self.video_preview_label.grid(row=2, column=0, sticky="nsew", padx=14, pady=(0, 8))
         self.video_info_label = ttk.Label(
             preview,
-            text="Uses latent walk generation. If you add a reference video, each dream frame is guided by sampled frames from it.",
+            text="Uses latent walk generation. Dreamify/Reconstruct mode keeps the reference frame visible and lets DDPM repaint it instead of replacing it.",
             style="Meta.TLabel", wraplength=520, justify="left",
         )
         self.video_info_label.grid(row=3, column=0, sticky="w", padx=14, pady=(0, 14))
@@ -1742,6 +2459,8 @@ class VideoTab(ttk.Frame):
             steps = int(self.video_steps.get())
             smoothness = int(self.video_smoothness.get())
             ref_influence = int(self.reference_influence.get())
+            source_preservation = int(self.source_preservation.get())
+            reference_mode = self.reference_mode.get()
         except ValueError:
             messagebox.showerror("Invalid settings", "Seconds, FPS, and sliders must contain valid numbers.")
             return None
@@ -1783,6 +2502,8 @@ class VideoTab(ttk.Frame):
             "steps": steps,
             "smoothness": smoothness,
             "reference_influence": ref_influence / 100.0,
+            "reference_mode": reference_mode,
+            "source_preservation": source_preservation / 100.0,
             "seed": seed,
             "output_path": out_path,
             "total_frames": total_frames,
@@ -1823,6 +2544,8 @@ class VideoTab(ttk.Frame):
                     smoothness=settings["smoothness"],
                     reference_video_path=settings["reference_video_path"],
                     reference_influence=settings["reference_influence"],
+                    reference_mode=settings["reference_mode"],
+                    source_preservation=settings["source_preservation"],
                     progress_callback=progress_callback,
                 )
                 saved_path = save_video_frames(frames, settings["output_path"], fps=settings["fps"])
@@ -1833,7 +2556,7 @@ class VideoTab(ttk.Frame):
                     self.video_progress.config(value=settings["total_frames"], maximum=settings["total_frames"])
                     self.video_status_label.config(text=f"Done. Saved video to: {saved_path}")
                     self.video_info_label.config(text=(
-                        f"Rendered {len(frames)} frame(s) at {settings['fps']} FPS. "
+                        f"Rendered {len(frames)} frame(s) at {settings['fps']} FPS using {settings['reference_mode']} mode. "
                         f"If MP4 export wasn't available, the app automatically fell back to GIF."
                     ))
                 self.after(0, finish)
@@ -1873,6 +2596,24 @@ class App:
         notebook.add(self.generate_tab, text="  Generate  ")
         notebook.add(self.video_tab, text="  Video  ")
         self.notebook = notebook
+
+        # Warn immediately when PyTorch cannot use CUDA. This prevents users
+        # with unsupported/very old GPUs from thinking the app is broken after
+        # a slow CPU-only training run or a mysterious exit code 1.
+        root.after(350, self._show_cuda_warning_if_needed)
+
+    def _show_cuda_warning_if_needed(self):
+        report = get_cuda_startup_report()
+        if report.get("cuda_available"):
+            return
+        should_continue = messagebox.askyesno(
+            "CUDA GPU Not Available",
+            build_cuda_warning_text(report),
+            icon="warning",
+            default="no",
+        )
+        if not should_continue:
+            self.root.destroy()
 
     def _setup_style(self):
         style = ttk.Style()

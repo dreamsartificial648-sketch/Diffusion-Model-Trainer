@@ -9,7 +9,7 @@ import math
 import os
 import shutil
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import accelerate
@@ -27,7 +27,7 @@ from torchvision import transforms
 from tqdm.auto import tqdm
 
 import diffusers
-from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel
+from diffusers import DDPMPipeline, DDPMScheduler, DDIMScheduler, UNet2DModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import is_accelerate_version, is_tensorboard_available, is_wandb_available
@@ -46,6 +46,61 @@ def emit_progress(enabled, **fields):
         return
     payload = {"ts": time.time(), **fields}
     print(f"PROGRESS_JSON:{json.dumps(payload)}", flush=True)
+
+
+def training_intensity_sleep_ratio(intensity):
+    """Return a soft cooldown pause ratio for each optimizer step.
+
+    This is intentionally not a strict GPU power limiter. It is a friendly
+    overnight/background throttle: after a real training step, sleep for a
+    fraction of that step's compute time. 100% sleeps never, 75% adds tiny
+    breathers, 50% is the useful quiet-ish zone, and 10% adds heavy pauses
+    for gaming/multitasking.
+    """
+    intensity = max(10, min(100, int(intensity)))
+    if intensity >= 100:
+        return 0.0
+    return ((100 - intensity) / 100.0) ** 2 * 1.6
+
+
+CUDA_CPU_WARNING_MESSAGE = (
+    "CUDA GPU not available. PyTorch is running on CPU. "
+    "Training DDPM models on CPU will be extremely slow. "
+    "Your GPU may be too old for modern PyTorch CUDA."
+)
+
+
+def get_cuda_training_warning():
+    """Return a user-friendly warning if this run will not use CUDA."""
+    try:
+        cuda_available = bool(torch.cuda.is_available())
+    except Exception as exc:
+        return {
+            "cuda_available": False,
+            "message": CUDA_CPU_WARNING_MESSAGE,
+            "details": f"PyTorch CUDA check failed: {exc}",
+        }
+
+    if cuda_available:
+        try:
+            name = torch.cuda.get_device_name(0)
+        except Exception:
+            name = "CUDA GPU"
+        return {
+            "cuda_available": True,
+            "message": f"CUDA GPU available: {name}",
+            "details": f"PyTorch {getattr(torch, '__version__', 'unknown')} | CUDA build {getattr(torch.version, 'cuda', None) or 'unknown'}",
+        }
+
+    return {
+        "cuda_available": False,
+        "message": CUDA_CPU_WARNING_MESSAGE,
+        "details": (
+            f"PyTorch {getattr(torch, '__version__', 'unknown')} | "
+            f"CUDA build {getattr(torch.version, 'cuda', None) or 'CPU-only / unavailable'} | "
+            "Device: CPU"
+        ),
+    }
 
 
 # Formats PIL can actually open as static images. GIF is deliberately
@@ -184,6 +239,32 @@ def format_bytes(num_bytes):
         size /= 1024
 
 
+def write_model_info(args, epoch=None, stopped=False):
+    """Write a tiny sidecar so model identity survives folder moves/renames."""
+    if not getattr(args, "model_name", None):
+        return None
+    info = {
+        "model_name": args.model_name,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "dataset_dir": str(args.train_data_dir) if args.train_data_dir else None,
+        "output_dir": str(args.output_dir),
+        "resolution": args.resolution,
+        "train_batch_size": args.train_batch_size,
+        "learning_rate": args.learning_rate,
+        "mixed_precision": args.mixed_precision,
+        "training_intensity": getattr(args, "training_intensity", 100),
+        "epoch": epoch,
+        "stopped": bool(stopped),
+    }
+    path = Path(args.output_dir) / "model_info.json"
+    try:
+        path.write_text(json.dumps(info, indent=2), encoding="utf-8")
+        return str(path)
+    except OSError as exc:
+        logger.warning(f"Could not write model_info.json: {exc}")
+        return None
+
+
 def cleanup_training_artifacts(output_dir, gui_progress=False, keep_latest_checkpoint=False):
     """Delete heavy training-only artifacts while keeping the loadable pipeline.
 
@@ -252,6 +333,7 @@ def save_pipeline_snapshot(accelerator, model, noise_scheduler, args, ema_model=
         ema_model.copy_to(unet.parameters())
     pipeline = DDPMPipeline(unet=unet, scheduler=noise_scheduler)
     pipeline.save_pretrained(args.output_dir, safe_serialization=True)
+    model_info_path = write_model_info(args, epoch=epoch, stopped=stopped)
     if args.use_ema and ema_model is not None:
         ema_model.restore(unet.parameters())
 
@@ -272,6 +354,8 @@ def save_pipeline_snapshot(accelerator, model, noise_scheduler, args, ema_model=
         size_bytes=final_size,
         size_human=format_bytes(final_size),
         storage_saver=args.storage_saver,
+        model_name=getattr(args, "model_name", None),
+        model_info_path=model_info_path,
     )
     return pipeline
 
@@ -341,6 +425,17 @@ class ImageTransform:
         return {"input": processed}
 
 
+
+
+def make_preview_scheduler(noise_scheduler, sampler="DDIM"):
+    """Build a preview-only scheduler without changing the training scheduler."""
+    sampler = (sampler or "DDIM").upper()
+    config = noise_scheduler.config
+    if sampler == "DDPM":
+        return DDPMScheduler.from_config(config)
+    return DDIMScheduler.from_config(config)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train unconditional DDPM on your images.")
     parser.add_argument(
@@ -373,6 +468,12 @@ def parse_args():
         default="output/model",
         help="Output directory for checkpoints and final model.",
     )
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default=None,
+        help="Friendly model name saved to model_info.json for the GUI/library.",
+    )
     parser.add_argument("--overwrite_output_dir", action="store_true")
     parser.add_argument(
         "--pretrained_model_path",
@@ -401,15 +502,33 @@ def parse_args():
         default=4,
         help="Batch size per device. 1 is safe for 6GB VRAM; 4 is a good starting point on 12GB Ampere cards.",
     )
+    parser.add_argument(
+        "--training_intensity",
+        type=int,
+        default=100,
+        help="Soft training throttle from 10-100. Lower values add cooldown pauses after GPU steps; 100 disables throttling.",
+    )
     parser.add_argument("--eval_batch_size", type=int, default=4)
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
-        default=4,
+        default=6,
         help="Background processes that load/augment images in parallel with GPU "
         "training. 0 forces the main process to do this serially between every "
-        "step, which leaves the GPU idle waiting on the CPU. 2-4 is a good "
-        "default on a modern desktop CPU; lower if you see system stutter.",
+        "step, which leaves the GPU idle waiting on the CPU. For an i5-10400, "
+        "test 4, 6, and 8; 6 is the default sweet spot.",
+    )
+    parser.add_argument(
+        "--pin_memory",
+        type=lambda x: x.lower() != "false",
+        default=True,
+        help="Use pinned RAM for faster CPU/RAM to CUDA transfer. Default: true.",
+    )
+    parser.add_argument(
+        "--prefetch_factor",
+        type=int,
+        default=2,
+        help="Batches each DataLoader worker preloads ahead of time. Only used when workers > 0.",
     )
     parser.add_argument("--num_epochs", type=int, default=100)
     parser.add_argument("--save_images_epochs", type=int, default=10)
@@ -477,6 +596,13 @@ def parse_args():
         "recognizable, not perfect, so we don't want to pay full sampling cost "
         "every save_images_epochs during training. Final model is unaffected.",
     )
+    parser.add_argument(
+        "--preview_sampler",
+        type=str,
+        default="DDIM",
+        choices=["DDPM", "DDIM"],
+        help="Sampler used only for in-training preview images. DDIM is usually faster; DDPM is the classic baseline.",
+    )
     parser.add_argument("--ddpm_beta_schedule", type=str, default="linear")
     parser.add_argument(
         "--checkpointing_steps",
@@ -528,6 +654,8 @@ def parse_args():
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
+    args.training_intensity = max(10, min(100, int(args.training_intensity)))
+
     if args.dataset_name is None and args.train_data_dir is None:
         raise ValueError("Specify --dataset_name or --train_data_dir.")
 
@@ -535,6 +663,25 @@ def parse_args():
 
 
 def main(args):
+    cuda_report = get_cuda_training_warning()
+    if not cuda_report.get("cuda_available"):
+        # Avoid trying fp16/bf16 CPU training. It is unsupported/pointless for this app
+        # and can turn a clear hardware limitation into a weird low-level crash.
+        original_precision = args.mixed_precision
+        if args.mixed_precision != "no":
+            args.mixed_precision = "no"
+            cuda_report["details"] += f" | Mixed precision changed from {original_precision} to no for CPU mode."
+
+        print(f"WARNING: {cuda_report['message']}", flush=True)
+        print(cuda_report.get("details", ""), flush=True)
+        emit_progress(
+            args.gui_progress,
+            event="hardware_warning",
+            message=cuda_report["message"],
+            details=cuda_report.get("details"),
+            cuda_available=False,
+        )
+
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
     kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=7200))
@@ -592,6 +739,10 @@ def main(args):
         level=logging.INFO,
     )
     logger.info(accelerator.state, main_process_only=False)
+    if not cuda_report.get("cuda_available"):
+        logger.warning(cuda_report["message"])
+        if cuda_report.get("details"):
+            logger.warning(cuda_report["details"])
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
         diffusers.utils.logging.set_verbosity_info()
@@ -763,8 +914,8 @@ def main(args):
         shuffle=True,
         num_workers=args.dataloader_num_workers,
         persistent_workers=args.dataloader_num_workers > 0,
-        prefetch_factor=2 if args.dataloader_num_workers > 0 else None,
-        pin_memory=torch.cuda.is_available(),
+        prefetch_factor=max(1, int(args.prefetch_factor)) if args.dataloader_num_workers > 0 else None,
+        pin_memory=bool(args.pin_memory and torch.cuda.is_available()),
     )
 
     lr_scheduler = get_scheduler(
@@ -795,7 +946,13 @@ def main(args):
     logger.info(f"  Batch size per device = {args.train_batch_size}")
     logger.info(f"  Total batch size = {total_batch_size}")
     logger.info(f"  Gradient accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(f"  DataLoader workers = {args.dataloader_num_workers}")
+    logger.info(f"  Pin memory = {bool(args.pin_memory and torch.cuda.is_available())}")
+    logger.info(f"  Preview inference steps = {args.preview_num_inference_steps}")
+    logger.info(f"  Preview sampler = {args.preview_sampler}")
     logger.info(f"  Total optimization steps = {max_train_steps}")
+    throttle_sleep_ratio = training_intensity_sleep_ratio(args.training_intensity)
+    logger.info(f"  Training intensity = {args.training_intensity}% (cooldown sleep ratio {throttle_sleep_ratio:.2f}x step time)")
 
     emit_progress(
         args.gui_progress and accelerator.is_main_process,
@@ -803,6 +960,14 @@ def main(args):
         num_epochs=args.num_epochs,
         steps_per_epoch=num_update_steps_per_epoch,
         total_steps=max_train_steps,
+        training_intensity=args.training_intensity,
+        throttle_sleep_ratio=throttle_sleep_ratio,
+        dataloader_workers=args.dataloader_num_workers,
+        pin_memory=bool(args.pin_memory and torch.cuda.is_available()),
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        effective_batch_size=total_batch_size,
+        preview_num_inference_steps=args.preview_num_inference_steps,
+        preview_sampler=args.preview_sampler,
     )
 
     global_step = 0
@@ -873,6 +1038,7 @@ def main(args):
                 if step % args.gradient_accumulation_steps == 0:
                     progress_bar.update(1)
                 continue
+            step_compute_start = time.time()
             with accelerator.accumulate(model):
                 clean_images = batch["input"].to(weight_dtype)
                 if args.channels_last and clean_images.is_cuda:
@@ -955,6 +1121,14 @@ def main(args):
                             eta_seconds=eta_seconds,
                         )
 
+                    if throttle_sleep_ratio > 0:
+                        step_compute_seconds = max(0.0, time.time() - step_compute_start)
+                        cooldown_seconds = min(5.0, step_compute_seconds * throttle_sleep_ratio)
+                        if cooldown_seconds > 0:
+                            if clean_images.is_cuda:
+                                torch.cuda.synchronize(clean_images.device)
+                            time.sleep(cooldown_seconds)
+
         progress_bar.close()
         if stop_requested:
             break
@@ -983,7 +1157,8 @@ def main(args):
                     ema_model.store(unet.parameters())
                     ema_model.copy_to(unet.parameters())
 
-                pipeline = DDPMPipeline(unet=unet, scheduler=noise_scheduler)
+                preview_scheduler = make_preview_scheduler(noise_scheduler, args.preview_sampler)
+                pipeline = DDPMPipeline(unet=unet, scheduler=preview_scheduler)
                 generator = torch.Generator(device=pipeline.device).manual_seed(0)
                 images = pipeline(
                     generator=generator,
