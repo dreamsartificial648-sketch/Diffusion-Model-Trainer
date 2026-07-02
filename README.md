@@ -1,4 +1,4 @@
-This is a practical, GPU-friendly way to train and experiment with diffusion models on consumer hardware. Perfect for learning how DDPM works without needing enterprise-scale infrastructure.
+This is a practical, GPU-friendly way to train and experiment with diffusion models on consumer hardware (atleast Gtx-series 10. Perfect for learning how DDPM works without needing enterprise-scale infrastructure.
 
 First, extract the downloaded zip file
 
