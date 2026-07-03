@@ -351,6 +351,59 @@ def generate_image(model_path_or_name: str, seed=None, sampler="DDPM"):
     return generate_images(model_path_or_name, seed=seed, num_inference_steps=50, batch_size=1, sampler=sampler)[0]
 
 
+def generate_reference_images(
+    model_path_or_name: str,
+    reference_image_path: str,
+    seed=None,
+    num_inference_steps=75,
+    batch_size=1,
+    sampler="DDPM",
+    reference_strength=65,
+):
+    """Reimagine an uploaded reference image through the selected DDPM model.
+
+    reference_strength is intentionally user-facing:
+      0   = mostly ignore the reference / normal random DDPM dream
+      50  = keep some big shapes, repaint heavily
+      100 = preserve the original image almost exactly
+
+    This is the still-image version of the troll-face/object-morph idea. It is
+    separate from the Video tab's reference-video reconstruction path.
+    """
+    import torch
+    from PIL import Image as PILImage
+
+    pipeline = load_pipeline(model_path_or_name)
+    pipeline = apply_sampler_to_pipeline(pipeline, sampler=sampler)
+    device = next(pipeline.unet.parameters()).device
+    dtype = next(pipeline.unet.parameters()).dtype
+    sample_w, sample_h = _get_model_sample_size(pipeline.unet)
+
+    reference_image = PILImage.open(reference_image_path).convert("RGB")
+    strength = max(0.0, min(1.0, float(reference_strength) / 100.0))
+
+    # At the far right of the slider, make the behavior obvious: the reference
+    # is preserved instead of being slightly cooked by one final denoise step.
+    if strength >= 0.999:
+        return [reference_image.resize((sample_w, sample_h), PILImage.BILINEAR) for _ in range(int(batch_size))]
+
+    base_seed = int(seed) if seed is not None else random.randint(0, 2_147_483_647)
+    images = []
+    for i in range(int(batch_size)):
+        generator = torch.Generator(device=device).manual_seed(base_seed + i)
+        noise = torch.randn((1, 3, sample_h, sample_w), generator=generator, device=device, dtype=dtype)
+        noise = _normalize_noise_tensor(noise)
+        frame_tensor = _sample_with_pipeline_from_reference(
+            pipeline,
+            reference_image,
+            noise,
+            num_inference_steps=num_inference_steps,
+            reference_influence=strength,
+        )
+        images.append(_model_tensor_to_pil(frame_tensor))
+    return images
+
+
 def _get_model_sample_size(unet):
     sample_size = getattr(unet.config, "sample_size", 128)
     if isinstance(sample_size, (list, tuple)) and len(sample_size) >= 2:
@@ -538,11 +591,11 @@ def generate_video_frames(
 
         frame_image = _model_tensor_to_pil(frame_tensor)
 
-        # APVD-inspired Dreamify/Reconstruct mode:
+        # Reference Reconstruct mode:
         # keep the reference frame as the structural anchor and let DDPM only
-        # push it into the model's dream style. This avoids the "same silhouette,
-        # totally different object" problem caused by full DDPM reimagination.
-        if ref_image is not None and str(reference_mode).lower().startswith("dreamify"):
+        # repaint it into the model's style. This is intentionally separate from
+        # APVD Dreamify; the Video tab should not pretend it is the old Dreamify tool.
+        if ref_image is not None and str(reference_mode).lower().startswith("reference reconstruct"):
             preserve = max(0.0, min(1.0, float(source_preservation)))
             dream_amount = 1.0 - preserve
             ref_resized = ref_image.convert("RGB").resize(frame_image.size)
@@ -559,6 +612,49 @@ def generate_video_frames(
             progress_callback(frame_index + 1, total_frames, frame_image)
 
     return frames
+
+
+def interpolate_video_frames(frames, output_frame_count):
+    """Create simple blended in-between frames so output FPS changes smoothness, not speed.
+
+    DDPM is expensive and generates independent dream samples. Rendering every
+    playback frame directly makes motion flickery/choppy. Instead, we render
+    fewer DDPM keyframes, then blend between neighboring keyframes for the final
+    video FPS. This is not fancy optical flow, but it makes the control behave
+    like users expect: higher output FPS means more in-between frames at the same
+    duration.
+    """
+    from PIL import Image as PILImage
+
+    if not frames:
+        return []
+
+    output_frame_count = max(1, int(output_frame_count))
+    if len(frames) == 1 or output_frame_count == 1:
+        return [frames[0].copy() for _ in range(output_frame_count)]
+
+    if output_frame_count == len(frames):
+        return [frame.copy() for frame in frames]
+
+    result = []
+    last_key = len(frames) - 1
+    for out_index in range(output_frame_count):
+        position = out_index * last_key / max(1, output_frame_count - 1)
+        left_index = int(position)
+        right_index = min(left_index + 1, last_key)
+        blend_amount = position - left_index
+
+        left = frames[left_index].convert("RGB")
+        right = frames[right_index].convert("RGB")
+        if left.size != right.size:
+            right = right.resize(left.size, PILImage.BILINEAR)
+
+        if right_index == left_index or blend_amount <= 0:
+            result.append(left.copy())
+        else:
+            result.append(PILImage.blend(left, right, float(blend_amount)))
+
+    return result
 
 
 def save_video_frames(frames, output_path, fps=24):
@@ -1983,6 +2079,22 @@ class GenerateTab(ttk.Frame):
         ttk.Entry(seed_frame, textvariable=self.seed_var, width=18, style="Field.TEntry").pack(anchor="w", fill="x", pady=(2, 0))
         ttk.Button(seed_frame, text="Randomize Seed", command=self._randomize_seed, style="Secondary.TButton").pack(anchor="w", pady=(6, 0))
 
+        ref_image_frame = ttk.Frame(controls, style="Card.TFrame")
+        ref_image_frame.pack(fill="x", padx=12, pady=(8, 4))
+        ttk.Label(ref_image_frame, text="Reference image (optional)", style="Meta.TLabel").pack(anchor="w")
+        self.reference_image_var = tk.StringVar(value="")
+        ttk.Entry(ref_image_frame, textvariable=self.reference_image_var, width=24, style="Field.TEntry").pack(anchor="w", fill="x", pady=(2, 0))
+        ref_image_buttons = ttk.Frame(ref_image_frame, style="Card.TFrame")
+        ref_image_buttons.pack(fill="x", pady=(6, 0))
+        ttk.Button(ref_image_buttons, text="Browse Image...", command=self._browse_reference_image, style="Secondary.TButton").pack(side="left")
+        ttk.Button(ref_image_buttons, text="Clear", command=self._clear_reference_image, style="Secondary.TButton").pack(side="left", padx=(6, 0))
+
+        self.reference_strength = LabeledScale(
+            controls, "Reference strength", from_=0, to=100, default=65,
+            tooltip="0 ignores the reference, 50-75 keeps the big shape while DDPM reimagines it, 100 preserves the original image."
+        )
+        self.reference_strength.pack(fill="x", padx=12, pady=6)
+
         out_frame = ttk.Frame(controls, style="Card.TFrame")
         out_frame.pack(fill="x", padx=12, pady=(8, 4))
         ttk.Label(out_frame, text="Save generated images to", style="Meta.TLabel").pack(anchor="w")
@@ -2123,6 +2235,21 @@ class GenerateTab(ttk.Frame):
         if chosen:
             self.image_output_dir_var.set(chosen)
 
+    def _browse_reference_image(self):
+        chosen = filedialog.askopenfilename(
+            title="Choose reference image",
+            initialdir=str(ROOT_DIR),
+            filetypes=[
+                ("Image files", "*.png *.jpg *.jpeg *.bmp *.webp *.gif"),
+                ("All files", "*.*"),
+            ],
+        )
+        if chosen:
+            self.reference_image_var.set(chosen)
+
+    def _clear_reference_image(self):
+        self.reference_image_var.set("")
+
     def _randomize_seed(self):
         self.seed_var.set(str(random.randint(0, 2_147_483_647)))
 
@@ -2160,6 +2287,12 @@ class GenerateTab(ttk.Frame):
         except ValueError:
             messagebox.showerror("Invalid generation settings", "Generation settings must be whole numbers.")
             return None
+
+        reference_image_path = self.reference_image_var.get().strip() if hasattr(self, "reference_image_var") else ""
+        if reference_image_path and not Path(reference_image_path).exists():
+            messagebox.showerror("Missing reference image", f"Reference image does not exist:\n{reference_image_path}")
+            return None
+
         return {
             "model_path": model_path,
             "seed": seed,
@@ -2167,6 +2300,8 @@ class GenerateTab(ttk.Frame):
             "sampler": self.sampler.get(),
             "batch_count": batch_count,
             "preview_size": preview_size,
+            "reference_image_path": reference_image_path,
+            "reference_strength": self.reference_strength.get() if hasattr(self, "reference_strength") else 0,
         }
 
     def _on_generate(self):
@@ -2175,17 +2310,34 @@ class GenerateTab(ttk.Frame):
             return
 
         self.generate_btn.config(state=tk.DISABLED)
-        self.gen_status_label.config(text=f"Generating {settings['batch_count']} image(s) with {settings['sampler']} at {settings['steps']} steps...")
+        if settings.get("reference_image_path"):
+            self.gen_status_label.config(
+                text=f"Reimagining reference image with {settings['sampler']} at {settings['steps']} steps "
+                     f"(strength {settings['reference_strength']}%)..."
+            )
+        else:
+            self.gen_status_label.config(text=f"Generating {settings['batch_count']} image(s) with {settings['sampler']} at {settings['steps']} steps...")
 
         def work():
             try:
-                images = generate_images(
-                    settings["model_path"],
-                    seed=settings["seed"],
-                    num_inference_steps=settings["steps"],
-                    batch_size=settings["batch_count"],
-                    sampler=settings["sampler"],
-                )
+                if settings.get("reference_image_path"):
+                    images = generate_reference_images(
+                        settings["model_path"],
+                        settings["reference_image_path"],
+                        seed=settings["seed"],
+                        num_inference_steps=settings["steps"],
+                        batch_size=settings["batch_count"],
+                        sampler=settings["sampler"],
+                        reference_strength=settings["reference_strength"],
+                    )
+                else:
+                    images = generate_images(
+                        settings["model_path"],
+                        seed=settings["seed"],
+                        num_inference_steps=settings["steps"],
+                        batch_size=settings["batch_count"],
+                        sampler=settings["sampler"],
+                    )
                 from PIL import Image as PILImage, ImageTk
 
                 # Make a simple preview grid for the app display.
@@ -2274,7 +2426,7 @@ class VideoTab(ttk.Frame):
         self.columnconfigure(1, weight=1)
         self.rowconfigure(1, weight=1)
 
-        header = ttk.Label(self, text="Dream Video Generator", style="Heading.TLabel")
+        header = ttk.Label(self, text="DDPM Video Generator", style="Heading.TLabel")
         header.grid(row=0, column=0, columnspan=2, sticky="w", padx=16, pady=(16, 8))
 
         controls = ttk.Frame(self, style="Card.TFrame")
@@ -2313,11 +2465,18 @@ class VideoTab(ttk.Frame):
         row = ttk.Frame(length_wrap, style="Card.TFrame")
         row.pack(fill="x", pady=(2, 0))
         self.seconds_var = tk.StringVar(value="4")
+        self.keyframe_fps_var = tk.StringVar(value="8")
         self.fps_var = tk.StringVar(value="24")
         ttk.Label(row, text="Seconds", style="Meta.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Entry(row, textvariable=self.seconds_var, width=8, style="Field.TEntry").grid(row=1, column=0, sticky="w", padx=(0, 10))
-        ttk.Label(row, text="FPS", style="Meta.TLabel").grid(row=0, column=1, sticky="w")
-        ttk.Entry(row, textvariable=self.fps_var, width=8, style="Field.TEntry").grid(row=1, column=1, sticky="w")
+        ttk.Label(row, text="DDPM keyframes/sec", style="Meta.TLabel").grid(row=0, column=1, sticky="w")
+        key_entry = ttk.Entry(row, textvariable=self.keyframe_fps_var, width=8, style="Field.TEntry")
+        key_entry.grid(row=1, column=1, sticky="w", padx=(0, 10))
+        ttk.Label(row, text="Output FPS", style="Meta.TLabel").grid(row=0, column=2, sticky="w")
+        fps_entry = ttk.Entry(row, textvariable=self.fps_var, width=8, style="Field.TEntry")
+        fps_entry.grid(row=1, column=2, sticky="w")
+        Tooltip(key_entry, "How many expensive DDPM keyframes to actually generate each second. Lower is smoother/cheaper after interpolation; higher changes the dream more often.")
+        Tooltip(fps_entry, "Playback FPS for the saved file. Higher values now create blended in-between frames instead of changing the video speed.")
 
         self.video_steps = LabeledScale(
             controls, "Inference steps", from_=10, to=120, default=60,
@@ -2339,15 +2498,15 @@ class VideoTab(ttk.Frame):
 
         self.reference_mode = LabeledCombo(
             controls, "Reference mode",
-            values=["Dreamify/Reconstruct", "Reimagine Shape"],
-            default="Dreamify/Reconstruct", width=20,
-            tooltip="Dreamify/Reconstruct keeps the source frame visible, APVD-style. Reimagine Shape is the older troll-face/object-morph style."
+            values=["Reference Reconstruct", "Reimagine Shape"],
+            default="Reference Reconstruct", width=20,
+            tooltip="Reference Reconstruct keeps the source frame visible and lets DDPM repaint it. Reimagine Shape is the older troll-face/object-morph style."
         )
         self.reference_mode.pack(fill="x", padx=12, pady=6)
 
         self.source_preservation = LabeledScale(
             controls, "Source preservation", from_=0, to=100, default=55,
-            tooltip="Only used in Dreamify/Reconstruct mode. Higher keeps more of the original frame; lower lets DDPM dream harder."
+            tooltip="Only used in Reference Reconstruct mode. Higher keeps more of the original frame; lower lets DDPM repaint harder."
         )
         self.source_preservation.pack(fill="x", padx=12, pady=6)
 
@@ -2374,7 +2533,7 @@ class VideoTab(ttk.Frame):
         self.generate_video_btn.pack(fill="x", padx=12, pady=(12, 6))
         ttk.Button(controls, text="Open Output Folder", command=self._open_output_folder, style="Secondary.TButton").pack(fill="x", padx=12, pady=(0, 12))
 
-        self.video_status_label = ttk.Label(preview, text="Ready. Generate a DDPM dream video.", style="Status.TLabel")
+        self.video_status_label = ttk.Label(preview, text="Ready. Generate a DDPM video.", style="Status.TLabel")
         self.video_status_label.grid(row=0, column=0, sticky="w", padx=14, pady=(12, 6))
         self.video_progress = ttk.Progressbar(preview, orient="horizontal", mode="determinate")
         self.video_progress.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 8))
@@ -2385,7 +2544,7 @@ class VideoTab(ttk.Frame):
         self.video_preview_label.grid(row=2, column=0, sticky="nsew", padx=14, pady=(0, 8))
         self.video_info_label = ttk.Label(
             preview,
-            text="Uses latent walk generation. Dreamify/Reconstruct mode keeps the reference frame visible and lets DDPM repaint it instead of replacing it.",
+            text="Uses DDPM keyframes plus blended in-between frames. Output FPS changes smoothness; DDPM keyframes/sec controls how many real diffusion frames are sampled.",
             style="Meta.TLabel", wraplength=520, justify="left",
         )
         self.video_info_label.grid(row=3, column=0, sticky="w", padx=14, pady=(0, 14))
@@ -2455,6 +2614,7 @@ class VideoTab(ttk.Frame):
 
         try:
             seconds = float(self.seconds_var.get().strip())
+            keyframe_fps = float(self.keyframe_fps_var.get().strip())
             fps = int(self.fps_var.get().strip())
             steps = int(self.video_steps.get())
             smoothness = int(self.video_smoothness.get())
@@ -2462,21 +2622,25 @@ class VideoTab(ttk.Frame):
             source_preservation = int(self.source_preservation.get())
             reference_mode = self.reference_mode.get()
         except ValueError:
-            messagebox.showerror("Invalid settings", "Seconds, FPS, and sliders must contain valid numbers.")
+            messagebox.showerror("Invalid settings", "Seconds, DDPM keyframes/sec, Output FPS, and sliders must contain valid numbers.")
             return None
 
         if seconds <= 0:
             messagebox.showerror("Invalid length", "Seconds must be greater than 0.")
             return None
+        if keyframe_fps <= 0:
+            messagebox.showerror("Invalid keyframe rate", "DDPM keyframes/sec must be greater than 0.")
+            return None
         if fps <= 0:
-            messagebox.showerror("Invalid FPS", "FPS must be greater than 0.")
+            messagebox.showerror("Invalid FPS", "Output FPS must be greater than 0.")
             return None
 
-        total_frames = int(round(seconds * fps))
+        total_frames = int(round(seconds * keyframe_fps))
+        output_frames = int(round(seconds * fps))
         if total_frames > 240:
             proceed = messagebox.askyesno(
                 "Large render",
-                f"This will render {total_frames} frames with DDPM sampling, which may take a while. Continue?"
+                f"This will render {total_frames} DDPM keyframes before interpolation, which may take a while. Continue?"
             )
             if not proceed:
                 return None
@@ -2499,6 +2663,7 @@ class VideoTab(ttk.Frame):
             "reference_video_path": ref_path or None,
             "seconds": seconds,
             "fps": fps,
+            "keyframe_fps": keyframe_fps,
             "steps": steps,
             "smoothness": smoothness,
             "reference_influence": ref_influence / 100.0,
@@ -2507,6 +2672,7 @@ class VideoTab(ttk.Frame):
             "seed": seed,
             "output_path": out_path,
             "total_frames": total_frames,
+            "output_frames": output_frames,
         }
 
     def _on_generate_video(self):
@@ -2516,7 +2682,7 @@ class VideoTab(ttk.Frame):
 
         self.generate_video_btn.config(state=tk.DISABLED)
         self.video_progress.config(value=0, maximum=max(1, settings["total_frames"]))
-        self.video_status_label.config(text=f"Generating {settings['total_frames']} frame(s)...")
+        self.video_status_label.config(text=f"Generating {settings['total_frames']} DDPM keyframe(s)...")
         self.video_info_label.config(text="")
 
         def progress_callback(done, total, frame_image):
@@ -2538,7 +2704,7 @@ class VideoTab(ttk.Frame):
                 frames = generate_video_frames(
                     settings["model_path"],
                     seconds=settings["seconds"],
-                    fps=settings["fps"],
+                    fps=settings["keyframe_fps"],
                     seed=settings["seed"],
                     num_inference_steps=settings["steps"],
                     smoothness=settings["smoothness"],
@@ -2548,7 +2714,8 @@ class VideoTab(ttk.Frame):
                     source_preservation=settings["source_preservation"],
                     progress_callback=progress_callback,
                 )
-                saved_path = save_video_frames(frames, settings["output_path"], fps=settings["fps"])
+                output_frames = interpolate_video_frames(frames, settings["output_frames"])
+                saved_path = save_video_frames(output_frames, settings["output_path"], fps=settings["fps"])
 
                 def finish():
                     self.last_video_path = saved_path
@@ -2556,7 +2723,7 @@ class VideoTab(ttk.Frame):
                     self.video_progress.config(value=settings["total_frames"], maximum=settings["total_frames"])
                     self.video_status_label.config(text=f"Done. Saved video to: {saved_path}")
                     self.video_info_label.config(text=(
-                        f"Rendered {len(frames)} frame(s) at {settings['fps']} FPS using {settings['reference_mode']} mode. "
+                        f"Rendered {len(frames)} DDPM keyframe(s), interpolated to {settings['output_frames']} output frame(s) at {settings['fps']} FPS using {settings['reference_mode']} mode. "
                         f"If MP4 export wasn't available, the app automatically fell back to GIF."
                     ))
                 self.after(0, finish)
