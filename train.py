@@ -243,11 +243,13 @@ def write_model_info(args, epoch=None, stopped=False):
     """Write a tiny sidecar so model identity survives folder moves/renames."""
     if not getattr(args, "model_name", None):
         return None
+    continued_from = getattr(args, "pretrained_model_path", None)
+    output_dir = str(args.output_dir)
     info = {
         "model_name": args.model_name,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "dataset_dir": str(args.train_data_dir) if args.train_data_dir else None,
-        "output_dir": str(args.output_dir),
+        "output_dir": output_dir,
         "resolution": args.resolution,
         "train_batch_size": args.train_batch_size,
         "learning_rate": args.learning_rate,
@@ -255,6 +257,9 @@ def write_model_info(args, epoch=None, stopped=False):
         "training_intensity": getattr(args, "training_intensity", 100),
         "epoch": epoch,
         "stopped": bool(stopped),
+        "training_mode": "continue_finetune" if continued_from else "fresh",
+        "continued_from_model": str(continued_from) if continued_from else None,
+        "retrained_in_place": bool(continued_from and Path(continued_from).resolve() == Path(output_dir).resolve()),
     }
     path = Path(args.output_dir) / "model_info.json"
     try:
@@ -774,15 +779,29 @@ def main(args):
                 f"Selected model is not a complete DDPMPipeline folder: {model_path}. "
                 "Pick a folder that contains model_index.json."
             )
+        same_output = Path(args.output_dir).resolve() == model_path.resolve()
         logger.info(f"Loading trained model to continue/fine-tune: {model_path}")
+        if same_output:
+            logger.info("Retrain-in-place mode: the updated model will be saved back into this same folder.")
         pipeline = DDPMPipeline.from_pretrained(str(model_path))
         model = pipeline.unet
         loaded_size = getattr(model.config, "sample_size", None)
+        adjusted_resolution = None
         if loaded_size is not None and int(loaded_size) != int(args.resolution):
             logger.warning(
                 f"Loaded model sample_size={loaded_size}, but training resolution={args.resolution}. "
-                "For safest continuation, use the same resolution as the trained model."
+                f"Switching training resolution to {loaded_size} so continuation matches the existing UNet."
             )
+            args.resolution = int(loaded_size)
+            adjusted_resolution = args.resolution
+        emit_progress(
+            args.gui_progress,
+            event="pretrained_loaded",
+            model_path=str(model_path),
+            output_dir=str(args.output_dir),
+            mode="retrain-in-place" if same_output else "continue/fine-tune",
+            adjusted_resolution=adjusted_resolution or args.resolution,
+        )
         del pipeline
     elif args.model_config_name_or_path is None:
         model = UNet2DModel(

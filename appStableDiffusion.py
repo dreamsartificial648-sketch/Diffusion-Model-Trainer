@@ -13,12 +13,15 @@ import json
 import os
 import queue
 import random
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
+import zipfile
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -220,6 +223,78 @@ def get_model_info(path: Path):
     }
 
 
+def normalize_prompt_words(text: str):
+    text = re.sub(r"[_\-\s]+", " ", str(text or "").lower()).strip()
+    return [word for word in re.findall(r"[a-z0-9]+", text) if word]
+
+
+def normalize_match_text(text: str) -> str:
+    return " ".join(normalize_prompt_words(text))
+
+
+def score_model_for_prompt(prompt: str, info: dict):
+    words = normalize_prompt_words(prompt)
+    if not words:
+        return 0
+
+    metadata = info.get("metadata") or {}
+    tags = metadata.get("tags") if isinstance(metadata, dict) else []
+    if not isinstance(tags, list):
+        tags = []
+
+    prompt_norm = normalize_match_text(prompt)
+    model_name = normalize_match_text(info.get("model_name") or info.get("name") or "")
+    display = normalize_match_text(info.get("display") or "")
+    path_text = normalize_match_text(info.get("path") or "")
+    folder_parts = []
+    try:
+        folder_parts = [normalize_match_text(part) for part in Path(info.get("path", "")).parts]
+    except Exception:
+        folder_parts = []
+    tag_texts = [normalize_match_text(tag) for tag in tags]
+
+    score = 0
+    reasons = []
+    if prompt_norm and prompt_norm in model_name:
+        score += 100
+        reasons.append("model name")
+
+    for word in words:
+        if word in model_name.split() or word in model_name:
+            score += 20
+            reasons.append(word)
+        if any(word == tag for tag in tag_texts):
+            score += 30
+            reasons.append(f"tag:{word}")
+        elif any(word in tag for tag in tag_texts):
+            score += 12
+            reasons.append(f"tag:{word}")
+        if word in display or word in path_text or any(word in part for part in folder_parts):
+            score += 10
+            reasons.append(f"path:{word}")
+        for token in model_name.split():
+            if len(word) >= 3 and (word in token or token in word):
+                score += 4
+                break
+
+    return score
+
+
+def find_best_model_match(prompt: str, model_infos):
+    candidates = []
+    for key, info in model_infos.items():
+        path = info.get("path")
+        if not path or path == PRETRAINED_MODEL:
+            continue
+        score = score_model_for_prompt(prompt, info)
+        if score > 0:
+            candidates.append((score, key, info))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    if not candidates:
+        return None, []
+    return candidates[0], candidates
+
+
 def model_label(path: Path, prefix="Model") -> str:
     info = get_model_info(path)
     return f"{prefix}: {info['model_name']}  ({info['resolution']}, {info['modified']})"
@@ -263,6 +338,95 @@ def copy_model_folder(src: Path, dst: Path):
         raise FileExistsError(f"Destination already exists and is not empty: {dst}")
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(src, dst, dirs_exist_ok=True)
+
+
+def _safe_zip_members(zip_file):
+    safe_members = []
+    rejected = []
+    for info in zip_file.infolist():
+        name = info.filename.replace("\\", "/")
+        member_path = Path(name)
+        if name.startswith("/") or member_path.is_absolute() or ".." in member_path.parts:
+            rejected.append(name)
+            continue
+        safe_members.append(info)
+    return safe_members, rejected
+
+
+def copy_imported_model_folder(src: Path, dst: Path):
+    skip_dirs = {"logs", "runs", "wandb", "__pycache__"}
+
+    def ignore(_dir, names):
+        ignored = set()
+        for name in names:
+            lower = name.lower()
+            if lower in skip_dirs or lower.startswith("checkpoint-"):
+                ignored.add(name)
+        return ignored
+
+    shutil.copytree(src, dst, ignore=ignore)
+
+
+def import_models_from_zip(zip_path, destination_root=DEFAULT_MODELS_ROOT):
+    zip_path = Path(zip_path).expanduser()
+    destination_root = Path(destination_root).expanduser()
+    result = {
+        "imported": [],
+        "skipped": [],
+        "errors": [],
+        "rejected_members": [],
+    }
+
+    if not zip_path.exists():
+        result["errors"].append(f"ZIP file does not exist: {zip_path}")
+        return result
+
+    destination_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="ddpm_import_", dir=str(ROOT_DIR)) as tmp:
+        tmp_root = Path(tmp)
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                safe_members, rejected = _safe_zip_members(zf)
+                result["rejected_members"].extend(rejected)
+                if rejected:
+                    result["errors"].append(f"Rejected {len(rejected)} unsafe ZIP path(s).")
+                for member in safe_members:
+                    zf.extract(member, tmp_root)
+        except zipfile.BadZipFile:
+            result["errors"].append("Selected file is not a valid ZIP archive.")
+            return result
+        except Exception as exc:
+            result["errors"].append(f"Could not extract ZIP: {exc}")
+            return result
+
+        model_dirs = []
+        for model_index in tmp_root.rglob("model_index.json"):
+            model_dir = model_index.parent
+            if is_loadable_model_dir(model_dir):
+                model_dirs.append(model_dir)
+
+        unique = []
+        seen = set()
+        for model_dir in model_dirs:
+            resolved = str(model_dir.resolve())
+            if resolved not in seen:
+                seen.add(resolved)
+                unique.append(model_dir)
+
+        if not unique:
+            result["skipped"].append("No folders containing model_index.json were found.")
+            return result
+
+        for model_dir in unique:
+            try:
+                friendly = get_friendly_model_name(model_dir)
+                dst = unique_child_dir(destination_root, friendly)
+                copy_imported_model_folder(model_dir, dst)
+                result["imported"].append(str(dst))
+            except Exception as exc:
+                result["errors"].append(f"Could not import {model_dir.name}: {exc}")
+
+    return result
 
 
 def open_folder(path: Path):
@@ -402,6 +566,61 @@ def generate_reference_images(
         )
         images.append(_model_tensor_to_pil(frame_tensor))
     return images
+
+
+def generate_masked_reference_image(
+    model_path_or_name: str,
+    source_image,
+    mask_image,
+    seed=None,
+    num_inference_steps=75,
+    sampler="DDPM",
+    reference_strength=65,
+    mask_blur=12,
+):
+    import numpy as np
+    import torch
+    from PIL import Image as PILImage, ImageFilter
+
+    pipeline = load_pipeline(model_path_or_name)
+    pipeline = apply_sampler_to_pipeline(pipeline, sampler=sampler)
+    device = next(pipeline.unet.parameters()).device
+    dtype = next(pipeline.unet.parameters()).dtype
+    sample_w, sample_h = _get_model_sample_size(pipeline.unet)
+
+    source = source_image.convert("RGB")
+    source_model = source.resize((sample_w, sample_h), PILImage.BILINEAR)
+    mask_model = mask_image.convert("L").resize((sample_w, sample_h), PILImage.BILINEAR)
+    blur = max(0, int(mask_blur))
+    if blur:
+        mask_model = mask_model.filter(ImageFilter.GaussianBlur(radius=blur))
+
+    mask_arr = np.asarray(mask_model).astype("float32") / 255.0
+    if float(mask_arr.max()) <= 0:
+        raise RuntimeError("Paint a mask before reimagining.")
+    mask_arr = np.clip(mask_arr, 0.0, 1.0)
+
+    strength = max(0.0, min(1.0, float(reference_strength) / 100.0))
+    generator = torch.Generator(device=device).manual_seed(
+        int(seed) if seed is not None else random.randint(0, 2_147_483_647)
+    )
+    noise = torch.randn((1, 3, sample_h, sample_w), generator=generator, device=device, dtype=dtype)
+    noise = _normalize_noise_tensor(noise)
+    generated_tensor = _sample_with_pipeline_from_reference(
+        pipeline,
+        source_model,
+        noise,
+        num_inference_steps=num_inference_steps,
+        reference_influence=strength,
+    )
+    generated = _model_tensor_to_pil(generated_tensor).convert("RGB")
+
+    source_arr = np.asarray(source_model).astype("float32")
+    generated_arr = np.asarray(generated).astype("float32")
+    mask_arr = mask_arr[..., None]
+    blended = (source_arr * (1.0 - mask_arr) + generated_arr * mask_arr).round().clip(0, 255).astype("uint8")
+    result = PILImage.fromarray(blended).resize(source.size, PILImage.BILINEAR)
+    return result
 
 
 def _get_model_sample_size(unet):
@@ -1098,8 +1317,9 @@ class TrainTab(ttk.Frame):
         base_entry = ttk.Entry(model_row, textvariable=self.base_model_var, style="Field.TEntry")
         base_entry.grid(row=0, column=1, sticky="ew")
         ttk.Button(model_row, text="Load Model...", command=self._browse_base_model, style="Secondary.TButton").grid(row=0, column=2, padx=(6, 0))
-        ttk.Button(model_row, text="Clear", command=lambda: self.base_model_var.set(""), style="Secondary.TButton").grid(row=0, column=3, padx=(6, 0))
-        Tooltip(base_entry, "Optional: pick an older trained DDPMPipeline folder to continue/fine-tune from. Leave blank to train from scratch.")
+        ttk.Button(model_row, text="Retrain Here", command=self._use_base_model_as_output, style="Secondary.TButton").grid(row=0, column=3, padx=(6, 0))
+        ttk.Button(model_row, text="Clear", command=lambda: self.base_model_var.set(""), style="Secondary.TButton").grid(row=0, column=4, padx=(6, 0))
+        Tooltip(base_entry, "Optional: pick an older trained DDPMPipeline folder to continue/fine-tune from. Leave blank to train from scratch. Use Retrain Here to save the continued training back into the same model folder.")
 
         out_row = ttk.Frame(settings, style="Panel.TFrame")
         out_row.grid(row=10, column=0, columnspan=3, sticky="ew", padx=6, pady=(2, 6))
@@ -1263,6 +1483,27 @@ class TrainTab(ttk.Frame):
             )
         self.base_model_var.set(str(resolved))
         self._try_apply_model_resolution(resolved)
+
+    def _use_base_model_as_output(self):
+        base_model = self.base_model_var.get().strip()
+        if not base_model:
+            messagebox.showinfo("Pick a model first", "Load a trained model first, then click Retrain Here.")
+            return
+        resolved = find_loadable_model_inside(Path(base_model))
+        if resolved is None:
+            messagebox.showerror("Not a loadable model", describe_model_problem(Path(base_model)))
+            return
+
+        self.base_model_var.set(str(resolved))
+        self.output_dir_var.set(str(resolved))
+        self.model_name_var.set(get_friendly_model_name(resolved))
+        self._try_apply_model_resolution(resolved)
+        self._append_log(f"Retrain mode: continuing from and saving back into {resolved}")
+        messagebox.showinfo(
+            "Retrain mode enabled",
+            "This training run will continue from the selected model and save the updated model back into the same folder.\n\n"
+            "Use this for extra epochs or adding new dataset images without deleting the model first."
+        )
 
     def _browse_output_dir(self):
         chosen = filedialog.askdirectory(initialdir=str(DEFAULT_MODELS_ROOT if DEFAULT_MODELS_ROOT.exists() else ROOT_DIR))
@@ -1437,6 +1678,11 @@ class TrainTab(ttk.Frame):
             else:
                 base_model = str(resolved_base)
                 self.base_model_var.set(base_model)
+                if output_dir.resolve() == resolved_base.resolve():
+                    # Intentional retrain/fine-tune-in-place mode. This lets you add epochs
+                    # or extra dataset images without deleting the old model folder first.
+                    self.model_name_var.set(get_friendly_model_name(resolved_base))
+                    self._try_apply_model_resolution(resolved_base)
 
         if errors:
             return None, errors
@@ -1806,6 +2052,14 @@ class TrainTab(ttk.Frame):
             details = evt.get("details")
             if details:
                 self._append_log(details)
+        elif kind == "pretrained_loaded":
+            model_path = evt.get("model_path")
+            mode = evt.get("mode", "continue/fine-tune")
+            if model_path:
+                self._append_log(f"Loaded existing model for {mode}: {model_path}")
+            adjusted = evt.get("adjusted_resolution")
+            if adjusted:
+                self._append_log(f"Using loaded model resolution: {adjusted}x{adjusted}")
         elif kind == "start":
             total_epochs = evt.get("num_epochs", "?")
             self.total_epochs = evt.get("num_epochs")
@@ -1919,6 +2173,7 @@ class GenerateTab(ttk.Frame):
         self.last_model_path = None
         self._checkpoint_paths = {}
         self._model_infos = {}
+        self._is_generating = False
         self._build_ui()
         self.refresh_checkpoints()
 
@@ -1933,6 +2188,18 @@ class GenerateTab(ttk.Frame):
         library = ttk.Frame(self, style="Card.TFrame")
         library.grid(row=1, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 10))
         library.columnconfigure(0, weight=1)
+
+        prompt_frame = ttk.Frame(library, style="Card.TFrame")
+        prompt_frame.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+        prompt_frame.columnconfigure(0, weight=1)
+        ttk.Label(prompt_frame, text="Prompt / model search", style="Meta.TLabel").grid(row=0, column=0, sticky="w")
+        self.prompt_var = tk.StringVar(value="")
+        self.prompt_entry = ttk.Entry(prompt_frame, textvariable=self.prompt_var, style="Field.TEntry")
+        self.prompt_entry.grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        self.prompt_entry.bind("<Return>", lambda _event: self._on_generate())
+        self.prompt_var.trace_add("write", lambda *_: self._update_prompt_match_preview())
+        self.prompt_match_label = ttk.Label(prompt_frame, text="Type a prompt to auto-pick a matching model.", style="Meta.TLabel")
+        self.prompt_match_label.grid(row=2, column=0, sticky="w", pady=(4, 0))
 
         self.model_tree = ttk.Treeview(
             library,
@@ -1949,14 +2216,15 @@ class GenerateTab(ttk.Frame):
         self.model_tree.column("resolution", width=90, stretch=False)
         self.model_tree.column("modified", width=135, stretch=False)
         self.model_tree.column("path", width=340, stretch=True)
-        self.model_tree.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+        self.model_tree.grid(row=1, column=0, sticky="ew", padx=12, pady=(4, 6))
         self.model_tree.bind("<<TreeviewSelect>>", self._on_model_tree_select)
         self.model_tree.bind("<Double-1>", lambda _e: self._load_selected_tree_model())
 
         library_buttons = ttk.Frame(library, style="Card.TFrame")
-        library_buttons.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
+        library_buttons.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 12))
         ttk.Button(library_buttons, text="Refresh Library", command=self.refresh_checkpoints, style="Secondary.TButton").pack(side="left")
         ttk.Button(library_buttons, text="Scan/Load Folder...", command=self._browse_model, style="Secondary.TButton").pack(side="left", padx=(8, 0))
+        ttk.Button(library_buttons, text="Import Model ZIP...", command=self._import_model_zip, style="Secondary.TButton").pack(side="left", padx=(8, 0))
         ttk.Button(library_buttons, text="Use Selected Model", command=self._load_selected_tree_model, style="Accent.TButton").pack(side="left", padx=(8, 0))
         ttk.Button(library_buttons, text="Open Folder", command=self._open_selected_model_folder, style="Secondary.TButton").pack(side="left", padx=(8, 0))
         ttk.Button(library_buttons, text="Save Selected As...", command=self._save_selected_model_as, style="Secondary.TButton").pack(side="left", padx=(8, 0))
@@ -1965,14 +2233,14 @@ class GenerateTab(ttk.Frame):
         main.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=16)
         main.columnconfigure(0, weight=0)
         main.columnconfigure(1, weight=1)
-        main.rowconfigure(1, weight=1)
+        main.rowconfigure(2, weight=1)
 
         # The image generation controls can be taller than the visible window,
         # especially on smaller monitors or with Windows display scaling.
         # Put the control panel inside a scrollable canvas so the Save button
         # can no longer sneak below the bottom of the app like cursed UI archaeology.
         controls_outer = ttk.Frame(main, style="Card.TFrame")
-        controls_outer.grid(row=0, column=0, rowspan=2, sticky="ns", padx=(0, 12), pady=(0, 16))
+        controls_outer.grid(row=0, column=0, rowspan=3, sticky="ns", padx=(0, 12), pady=(0, 16))
         controls_outer.rowconfigure(0, weight=1)
         controls_outer.columnconfigure(0, weight=1)
 
@@ -2108,9 +2376,11 @@ class GenerateTab(ttk.Frame):
 
         self.gen_status_label = ttk.Label(main, text="Ready.", style="Status.TLabel")
         self.gen_status_label.grid(row=0, column=1, sticky="w", pady=(0, 8))
+        self.gen_progress = ttk.Progressbar(main, orient="horizontal", mode="indeterminate")
+        self.gen_progress.grid(row=1, column=1, sticky="ew", pady=(0, 8))
 
         image_frame = ttk.Frame(main, style="Card.TFrame")
-        image_frame.grid(row=1, column=1, sticky="nsew", pady=(0, 16))
+        image_frame.grid(row=2, column=1, sticky="nsew", pady=(0, 16))
         self.image_label = tk.Label(
             image_frame, text="Image will appear here", bg=BG_FIELD, fg=FG_DIM, font=(FONT_FAMILY, 12),
         )
@@ -2149,6 +2419,7 @@ class GenerateTab(ttk.Frame):
             self.model_tree.selection_set(target_key)
             self.model_tree.focus(target_key)
             self._on_model_tree_select()
+        self._update_prompt_match_preview()
 
     def get_selected_model_key(self):
         selection = self.model_tree.selection()
@@ -2162,6 +2433,45 @@ class GenerateTab(ttk.Frame):
         if key:
             return self._checkpoint_paths.get(key)
         return None
+
+    def _select_model_key(self, key):
+        if not key or key not in self._checkpoint_paths:
+            return False
+        self.model_tree.selection_set(key)
+        self.model_tree.focus(key)
+        self.model_tree.see(key)
+        self._on_model_tree_select()
+        self.last_model_path = self._checkpoint_paths.get(key)
+        return True
+
+    def _update_prompt_match_preview(self):
+        if not hasattr(self, "prompt_match_label"):
+            return
+        prompt = self.prompt_var.get().strip() if hasattr(self, "prompt_var") else ""
+        if not prompt:
+            self.prompt_match_label.config(text="Type a prompt to auto-pick a matching model.")
+            return
+        best, candidates = find_best_model_match(prompt, self._model_infos)
+        if not best:
+            self.prompt_match_label.config(text=f"No matching model found for: {prompt}")
+            return
+        score, _key, info = best
+        close_count = sum(1 for item in candidates[1:] if item[0] >= max(1, score - 15))
+        suffix = f" (+{close_count} close match{'es' if close_count != 1 else ''})" if close_count else ""
+        self.prompt_match_label.config(text=f"Best match: {info.get('model_name', info.get('display', 'Model'))}{suffix}")
+
+    def _route_prompt_to_model(self):
+        prompt = self.prompt_var.get().strip() if hasattr(self, "prompt_var") else ""
+        if not prompt:
+            return True
+        best, _candidates = find_best_model_match(prompt, self._model_infos)
+        if not best:
+            self.gen_status_label.config(text=f"No matching model found for: {prompt}. Try importing models or opening the model folder.")
+            return False
+        _score, key, info = best
+        self._select_model_key(key)
+        self.prompt_match_label.config(text=f"Best match: {info.get('model_name', info.get('display', 'Model'))}")
+        return True
 
     def _on_model_tree_select(self, _event=None):
         key = self.get_selected_model_key()
@@ -2229,6 +2539,39 @@ class GenerateTab(ttk.Frame):
             return
         self.refresh_checkpoints()
         self.gen_status_label.config(text=f"Saved selected model to: {dst}")
+
+    def _import_model_zip(self):
+        chosen = filedialog.askopenfilename(
+            title="Import DDPM model ZIP",
+            initialdir=str(ROOT_DIR),
+            filetypes=[("ZIP files", "*.zip"), ("All files", "*.*")],
+        )
+        if not chosen:
+            return
+        self.gen_status_label.config(text="Importing model ZIP...")
+        self.update_idletasks()
+        result = import_models_from_zip(chosen, DEFAULT_MODELS_ROOT)
+        self.refresh_checkpoints()
+        if hasattr(self.app, "video_tab"):
+            self.app.video_tab.refresh_models()
+        if hasattr(self.app, "canvas_tab"):
+            self.app.canvas_tab.refresh_models()
+        imported = result.get("imported", [])
+        skipped = result.get("skipped", [])
+        errors = result.get("errors", [])
+        message = f"Imported {len(imported)} model(s)."
+        if skipped:
+            message += f"\nSkipped {len(skipped)} folder(s)/item(s)."
+        if errors:
+            message += "\n\n" + "\n".join(errors[:5])
+        self.gen_status_label.config(text=message.replace("\n", " "))
+        if imported:
+            first_imported = imported[0]
+            for key, path in self._checkpoint_paths.items():
+                if str(Path(path)) == str(Path(first_imported)):
+                    self._select_model_key(key)
+                    break
+        messagebox.showinfo("Import Model ZIP", message)
 
     def _browse_image_output_dir(self):
         chosen = filedialog.askdirectory(initialdir=self.image_output_dir_var.get() or str(DEFAULT_GENERATIONS_DIR))
@@ -2305,18 +2648,24 @@ class GenerateTab(ttk.Frame):
         }
 
     def _on_generate(self):
+        if self._is_generating:
+            return
+        if not self._route_prompt_to_model():
+            return
         settings = self._validated_generation_settings()
         if settings is None:
             return
 
+        self._is_generating = True
         self.generate_btn.config(state=tk.DISABLED)
+        self.gen_progress.start(12)
         if settings.get("reference_image_path"):
             self.gen_status_label.config(
-                text=f"Reimagining reference image with {settings['sampler']} at {settings['steps']} steps "
-                     f"(strength {settings['reference_strength']}%)..."
+                text=f"Cooking DDPM dream... Reimagining reference image with {settings['sampler']} at {settings['steps']} steps "
+                     f"(strength {settings['reference_strength']}%)."
             )
         else:
-            self.gen_status_label.config(text=f"Generating {settings['batch_count']} image(s) with {settings['sampler']} at {settings['steps']} steps...")
+            self.gen_status_label.config(text=f"Cooking DDPM dream... Generating {settings['batch_count']} image(s) with {settings['sampler']} at {settings['steps']} steps.")
 
         def work():
             try:
@@ -2359,7 +2708,9 @@ class GenerateTab(ttk.Frame):
                     self.gen_status_label.config(
                         text=f"Done. Native model output: {first.width}x{first.height}. Preview shown enlarged."
                     )
+                    self.gen_progress.stop()
                     self.generate_btn.config(state=tk.NORMAL)
+                    self._is_generating = False
 
                 self.after(0, update_ui)
             except Exception as e:
@@ -2375,7 +2726,9 @@ class GenerateTab(ttk.Frame):
                             + error_text[:250]
                         )
                     self.gen_status_label.config(text=f"Error: {friendly}")
+                    self.gen_progress.stop()
                     self.generate_btn.config(state=tk.NORMAL)
+                    self._is_generating = False
 
                 self.after(0, show_error)
 
@@ -2406,6 +2759,294 @@ class GenerateTab(ttk.Frame):
             img.save(path)
             saved.append(path)
         self.gen_status_label.config(text=f"Saved {len(saved)} image(s) to: {out_dir}")
+
+
+# ----------------------------------------------------------------------------
+# Canvas tab
+# ----------------------------------------------------------------------------
+class CanvasTab(ttk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, style="Panel.TFrame")
+        self.app = app
+        self.source_image = None
+        self.mask_image = None
+        self.result_image = None
+        self.canvas_photo_ref = None
+        self._model_paths_by_label = {}
+        self._display_image_size = (1, 1)
+        self._display_offset = (0, 0)
+        self._drawing = False
+        self._build_ui()
+        self.refresh_models()
+
+    def _build_ui(self):
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        header = ttk.Label(self, text="Canvas Mask Reimagine", style="Heading.TLabel")
+        header.grid(row=0, column=0, columnspan=2, sticky="w", padx=16, pady=(16, 8))
+
+        controls = ttk.Frame(self, style="Card.TFrame")
+        controls.grid(row=1, column=0, sticky="ns", padx=(16, 10), pady=(0, 16))
+        preview = ttk.Frame(self, style="Card.TFrame")
+        preview.grid(row=1, column=1, sticky="nsew", padx=(0, 16), pady=(0, 16))
+        preview.columnconfigure(0, weight=1)
+        preview.rowconfigure(1, weight=1)
+
+        ttk.Label(controls, text="Canvas Controls", style="Meta.TLabel").pack(anchor="w", padx=12, pady=(12, 8))
+
+        model_wrap = ttk.Frame(controls, style="Card.TFrame")
+        model_wrap.pack(fill="x", padx=12, pady=6)
+        ttk.Label(model_wrap, text="Model", style="Meta.TLabel").pack(anchor="w")
+        self.canvas_model_var = tk.StringVar()
+        self.canvas_model_combo = ttk.Combobox(model_wrap, textvariable=self.canvas_model_var, state="readonly", width=28)
+        self.canvas_model_combo.pack(fill="x", pady=(2, 4))
+        model_buttons = ttk.Frame(model_wrap, style="Card.TFrame")
+        model_buttons.pack(fill="x")
+        ttk.Button(model_buttons, text="Refresh", command=self.refresh_models, style="Secondary.TButton").pack(side="left")
+        ttk.Button(model_buttons, text="Use Generate Selection", command=self._use_generate_model, style="Secondary.TButton").pack(side="left", padx=(6, 0))
+
+        ttk.Button(controls, text="Load Image...", command=self._load_image, style="Secondary.TButton").pack(fill="x", padx=12, pady=(8, 6))
+
+        self.brush_size = LabeledScale(controls, "Brush size", from_=4, to=160, default=36)
+        self.brush_size.pack(fill="x", padx=12, pady=6)
+        self.mask_softness = LabeledScale(controls, "Mask softness", from_=0, to=40, default=12)
+        self.mask_softness.pack(fill="x", padx=12, pady=6)
+        self.reference_intensity = LabeledScale(
+            controls,
+            "Reference intensity",
+            from_=0,
+            to=100,
+            default=65,
+            tooltip="Higher values preserve more of the loaded image structure before blending the masked dream region.",
+        )
+        self.reference_intensity.pack(fill="x", padx=12, pady=6)
+        self.canvas_steps = LabeledScale(controls, "Steps", from_=10, to=200, default=75)
+        self.canvas_steps.pack(fill="x", padx=12, pady=6)
+        self.canvas_sampler = LabeledCombo(controls, "Sampler", values=["DDPM", "DDIM"], default="DDIM", width=10)
+        self.canvas_sampler.pack(fill="x", padx=12, pady=6)
+
+        seed_wrap = ttk.Frame(controls, style="Card.TFrame")
+        seed_wrap.pack(fill="x", padx=12, pady=6)
+        ttk.Label(seed_wrap, text="Seed (optional)", style="Meta.TLabel").pack(anchor="w")
+        self.canvas_seed_var = tk.StringVar(value="")
+        ttk.Entry(seed_wrap, textvariable=self.canvas_seed_var, style="Field.TEntry").pack(fill="x", pady=(2, 4))
+        ttk.Button(seed_wrap, text="Randomize Seed", command=self._randomize_seed, style="Secondary.TButton").pack(anchor="w")
+
+        self.reimagine_btn = ttk.Button(controls, text="Reimagine Mask", command=self._on_reimagine_mask, style="Accent.TButton")
+        self.reimagine_btn.pack(fill="x", padx=12, pady=(12, 6))
+        ttk.Button(controls, text="Clear Mask", command=self._clear_mask, style="Secondary.TButton").pack(fill="x", padx=12, pady=(0, 6))
+        ttk.Button(controls, text="Save Image", command=self._save_canvas_image, style="Secondary.TButton").pack(fill="x", padx=12, pady=(0, 12))
+
+        self.canvas_status_label = ttk.Label(preview, text="Load an image and paint where DDPM should dream.", style="Status.TLabel")
+        self.canvas_status_label.grid(row=0, column=0, sticky="w", padx=14, pady=(12, 8))
+        self.draw_canvas = tk.Canvas(preview, bg=BG_FIELD, highlightthickness=0, bd=0)
+        self.draw_canvas.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
+        self.draw_canvas.bind("<Configure>", lambda _event: self._redraw_canvas())
+        self.draw_canvas.bind("<ButtonPress-1>", self._begin_paint)
+        self.draw_canvas.bind("<B1-Motion>", self._paint)
+        self.draw_canvas.bind("<ButtonRelease-1>", lambda _event: setattr(self, "_drawing", False))
+
+    def refresh_models(self):
+        checkpoints = find_checkpoints(DEFAULT_MODELS_ROOT)
+        self._model_paths_by_label = {}
+        labels = []
+        for _label, path, _mtime, info in checkpoints:
+            combo_label = f"{info['display']} ({info['resolution']})"
+            labels.append(combo_label)
+            self._model_paths_by_label[combo_label] = path
+        if not labels:
+            labels = ["Pretrained demo model (128x128)"]
+            self._model_paths_by_label[labels[0]] = PRETRAINED_MODEL
+        self.canvas_model_combo.config(values=labels)
+        if self.canvas_model_var.get() not in labels:
+            self.canvas_model_var.set(labels[0])
+
+    def _use_generate_model(self):
+        model_path = self.app.get_preferred_model_path()
+        if not model_path:
+            messagebox.showerror("No model selected", "Select or load a model in the Generate tab first, or pick one here.")
+            return
+        for label, path in self._model_paths_by_label.items():
+            if path == model_path:
+                self.canvas_model_var.set(label)
+                self.canvas_status_label.config(text=f"Using model from Generate tab: {label}")
+                return
+        self.refresh_models()
+
+    def _load_image(self):
+        chosen = filedialog.askopenfilename(
+            title="Choose canvas image",
+            initialdir=str(ROOT_DIR),
+            filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.webp *.gif"), ("All files", "*.*")],
+        )
+        if not chosen:
+            return
+        from PIL import Image as PILImage
+        self.source_image = PILImage.open(chosen).convert("RGB")
+        self.result_image = None
+        self.mask_image = PILImage.new("L", self.source_image.size, 0)
+        self.canvas_status_label.config(text="Paint where DDPM should dream.")
+        self._redraw_canvas()
+
+    def _canvas_to_image_xy(self, event):
+        if self.source_image is None:
+            return None
+        disp_w, disp_h = self._display_image_size
+        off_x, off_y = self._display_offset
+        x = event.x - off_x
+        y = event.y - off_y
+        if x < 0 or y < 0 or x > disp_w or y > disp_h:
+            return None
+        src_w, src_h = self.source_image.size
+        return int(x * src_w / max(1, disp_w)), int(y * src_h / max(1, disp_h))
+
+    def _begin_paint(self, event):
+        self._drawing = True
+        self._paint(event)
+
+    def _paint(self, event):
+        if not self._drawing or self.source_image is None or self.mask_image is None:
+            return
+        xy = self._canvas_to_image_xy(event)
+        if xy is None:
+            return
+        from PIL import ImageDraw
+        draw = ImageDraw.Draw(self.mask_image)
+        radius = max(1, int(self.brush_size.get()) // 2)
+        x, y = xy
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=255)
+        self._redraw_canvas()
+
+    def _compose_canvas_preview(self):
+        from PIL import Image as PILImage
+        base = (self.result_image or self.source_image).convert("RGB")
+        if self.mask_image is None:
+            return base
+        overlay = PILImage.new("RGBA", base.size, (255, 70, 70, 0))
+        alpha = self.mask_image.point(lambda p: int(p * 0.35))
+        overlay.putalpha(alpha)
+        return PILImage.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
+
+    def _redraw_canvas(self):
+        if self.source_image is None:
+            self.draw_canvas.delete("all")
+            self.draw_canvas.create_text(
+                max(20, self.draw_canvas.winfo_width() // 2),
+                max(20, self.draw_canvas.winfo_height() // 2),
+                text="Load an image to begin",
+                fill=FG_DIM,
+                font=(FONT_FAMILY, 12),
+            )
+            return
+        from PIL import ImageTk
+        preview = self._compose_canvas_preview()
+        cw = max(1, self.draw_canvas.winfo_width())
+        ch = max(1, self.draw_canvas.winfo_height())
+        scale = min(cw / preview.width, ch / preview.height)
+        scale = min(scale, 1.0) if scale <= 0 else scale
+        disp_size = (max(1, int(preview.width * scale)), max(1, int(preview.height * scale)))
+        display = preview.resize(disp_size)
+        self._display_image_size = disp_size
+        self._display_offset = ((cw - disp_size[0]) // 2, (ch - disp_size[1]) // 2)
+        self.canvas_photo_ref = ImageTk.PhotoImage(display)
+        self.draw_canvas.delete("all")
+        self.draw_canvas.create_image(self._display_offset[0], self._display_offset[1], image=self.canvas_photo_ref, anchor="nw")
+
+    def _clear_mask(self):
+        if self.source_image is None:
+            return
+        from PIL import Image as PILImage
+        self.mask_image = PILImage.new("L", self.source_image.size, 0)
+        self.canvas_status_label.config(text="Mask cleared. Paint where DDPM should dream.")
+        self._redraw_canvas()
+
+    def _randomize_seed(self):
+        self.canvas_seed_var.set(str(random.randint(0, 2_147_483_647)))
+
+    def _validated_canvas_settings(self):
+        if self.source_image is None or self.mask_image is None:
+            messagebox.showerror("No image", "Load an image and paint a mask first.")
+            return None
+        if self.mask_image.getbbox() is None:
+            messagebox.showerror("No mask", "Paint a mask before reimagining.")
+            return None
+        seed_val = self.canvas_seed_var.get().strip()
+        try:
+            seed = int(seed_val) if seed_val else None
+        except ValueError:
+            messagebox.showerror("Invalid seed", "Seed must be a whole number, or left blank.")
+            return None
+        label = self.canvas_model_var.get().strip()
+        return {
+            "model_path": self._model_paths_by_label.get(label, PRETRAINED_MODEL),
+            "seed": seed,
+            "steps": int(self.canvas_steps.get()),
+            "sampler": self.canvas_sampler.get(),
+            "reference_strength": int(self.reference_intensity.get()),
+            "mask_blur": int(self.mask_softness.get()),
+            "source": self.source_image.copy(),
+            "mask": self.mask_image.copy(),
+        }
+
+    def _on_reimagine_mask(self):
+        settings = self._validated_canvas_settings()
+        if settings is None:
+            return
+        self.reimagine_btn.config(state=tk.DISABLED)
+        self.canvas_status_label.config(text="Cooking masked region...")
+
+        def worker():
+            try:
+                result = generate_masked_reference_image(
+                    settings["model_path"],
+                    settings["source"],
+                    settings["mask"],
+                    seed=settings["seed"],
+                    num_inference_steps=settings["steps"],
+                    sampler=settings["sampler"],
+                    reference_strength=settings["reference_strength"],
+                    mask_blur=settings["mask_blur"],
+                )
+
+                def finish():
+                    self.result_image = result
+                    self.source_image = result.copy()
+                    self.mask_image = settings["mask"]
+                    self.reimagine_btn.config(state=tk.NORMAL)
+                    self.canvas_status_label.config(text="Done.")
+                    self._redraw_canvas()
+                self.after(0, finish)
+            except Exception as exc:
+                error_text = str(exc)[:500]
+
+                def fail():
+                    self.reimagine_btn.config(state=tk.NORMAL)
+                    self.canvas_status_label.config(text=f"Error: {error_text}")
+                self.after(0, fail)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _save_canvas_image(self):
+        image = self.result_image or self.source_image
+        if image is None:
+            messagebox.showerror("No image", "Load or generate an image first.")
+            return
+        label = self.canvas_model_var.get().strip()
+        model_path = self._model_paths_by_label.get(label, PRETRAINED_MODEL)
+        if model_path != PRETRAINED_MODEL:
+            model_info = get_model_info(Path(model_path))
+            model_name = model_info.get("model_name", "Model")
+        else:
+            model_name = "Pretrained demo"
+        out_dir = DEFAULT_GENERATIONS_DIR / sanitize_filename_component(model_name) / "canvas"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        image_path = out_dir / f"{sanitize_filename_component(model_name)}_canvas_{stamp}.png"
+        image.save(image_path)
+        if self.mask_image is not None:
+            self.mask_image.save(out_dir / f"{sanitize_filename_component(model_name)}_canvas_mask_{stamp}.png")
+        self.canvas_status_label.config(text=f"Saved canvas image to: {image_path}")
 
 
 # ----------------------------------------------------------------------------
@@ -2757,10 +3398,12 @@ class App:
 
         self.train_tab = TrainTab(notebook, self)
         self.generate_tab = GenerateTab(notebook, self)
+        self.canvas_tab = CanvasTab(notebook, self)
         self.video_tab = VideoTab(notebook, self)
 
         notebook.add(self.train_tab, text="  Train  ")
         notebook.add(self.generate_tab, text="  Generate  ")
+        notebook.add(self.canvas_tab, text="  Canvas  ")
         notebook.add(self.video_tab, text="  Video  ")
         self.notebook = notebook
 
@@ -2838,16 +3481,20 @@ class App:
         GPU and the output directory, so it's safer to avoid sampling mid-save."""
         state = tk.DISABLED if active else tk.NORMAL
         self.generate_tab.generate_btn.config(state=state)
+        self.canvas_tab.reimagine_btn.config(state=state)
         self.video_tab.generate_video_btn.config(state=state)
         if active:
             self.generate_tab.gen_status_label.config(text="Training is running — Generate will unlock when it's done.")
+            self.canvas_tab.canvas_status_label.config(text="Training is running - Canvas will unlock when it's done.")
             self.video_tab.video_status_label.config(text="Training is running — Video will unlock when it's done.")
         else:
             self.generate_tab.gen_status_label.config(text="Ready.")
+            self.canvas_tab.canvas_status_label.config(text="Load an image and paint where DDPM should dream.")
             self.video_tab.video_status_label.config(text="Ready. Generate a DDPM dream video.")
 
     def notify_training_complete(self):
         self.generate_tab.refresh_checkpoints()
+        self.canvas_tab.refresh_models()
         self.video_tab.refresh_models()
 
     def get_preferred_model_path(self):
