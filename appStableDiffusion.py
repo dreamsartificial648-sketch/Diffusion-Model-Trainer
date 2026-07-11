@@ -10,6 +10,7 @@ Two tabs:
 """
 
 import json
+import gc
 import os
 import queue
 import random
@@ -45,17 +46,35 @@ FONT_FAMILY = "Segoe UI"
 # ----------------------------------------------------------------------------
 ROOT_DIR = Path(__file__).resolve().parent
 TRAIN_SCRIPT = ROOT_DIR / "train.py"
+if not TRAIN_SCRIPT.exists():
+    # Chat/download copies are sometimes numbered (train(31).py). Accept the
+    # newest numbered copy so the GUI does not fail merely because of its name.
+    numbered_trainers = sorted(
+        ROOT_DIR.glob("train*.py"), key=lambda p: p.stat().st_mtime, reverse=True
+    )
+    if numbered_trainers:
+        TRAIN_SCRIPT = numbered_trainers[0]
 DEFAULT_OUTPUT_DIR = ROOT_DIR / "output" / "model"
 DEFAULT_MODELS_ROOT = ROOT_DIR / "output"
 DEFAULT_DATA_DIR = ROOT_DIR / "data"
 DEFAULT_GENERATIONS_DIR = ROOT_DIR / "output" / "generations"
 MODEL_INFO_FILE = "model_info.json"
+APP_SETTINGS_FILE = ROOT_DIR / "ddpm_gui_settings.json"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif"}
 PRETRAINED_MODEL = "anton-l/ddpm-butterflies-128"
 
 PIPELINE = None  # lazily-loaded diffusers pipeline, cached across generations
 PIPELINE_SOURCE = None  # path/name the cached pipeline was loaded from
 PIPELINE_SCHEDULER_CONFIG = None  # original scheduler config, used when swapping samplers
+PIPELINE_LOCK = threading.RLock()  # scheduler/model globals are shared by Generate, Canvas, and Video
+
+
+def synchronized_inference(func):
+    """Serialize all tabs that mutate/use the shared pipeline and scheduler."""
+    def wrapped(*args, **kwargs):
+        with PIPELINE_LOCK:
+            return func(*args, **kwargs)
+    return wrapped
 
 SAMPLER_DESCRIPTIONS = {
     "DDPM": (
@@ -457,7 +476,17 @@ def load_pipeline(model_path_or_name: str):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if device == "cuda" else torch.float32
 
-    pipeline = DDPMPipeline.from_pretrained(model_path_or_name)
+    # Release the old CUDA model *before* moving a replacement to the GPU. Without
+    # this, model switching briefly holds two UNets and can OOM even at 1:1.
+    if PIPELINE is not None:
+        PIPELINE = None
+        PIPELINE_SOURCE = None
+        PIPELINE_SCHEDULER_CONFIG = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    pipeline = DDPMPipeline.from_pretrained(model_path_or_name, torch_dtype=dtype)
     pipeline = pipeline.to(device, dtype)
 
     if device == "cuda":
@@ -486,7 +515,46 @@ def apply_sampler_to_pipeline(pipeline, sampler="DDPM"):
     return pipeline
 
 
-def generate_images(model_path_or_name: str, seed=None, num_inference_steps=50, batch_size=1, sampler="DDPM"):
+ASPECT_RATIOS = {
+    "1:1 (Square)": (1, 1),
+    "16:9 (Widescreen)": (16, 9),
+    "9:16 (Portrait)": (9, 16),
+    "4:3 (Classic)": (4, 3),
+    "3:4 (Portrait Classic)": (3, 4),
+    "3:2 (Photo)": (3, 2),
+    "2:3 (Portrait Photo)": (2, 3),
+}
+
+
+def _get_unet_size_multiple(unet):
+    """Return the spatial multiple required by this UNet's down/up path."""
+    down_blocks = getattr(unet.config, "down_block_types", None)
+    if down_blocks:
+        # Every down block except the final one normally halves the image.
+        return max(8, 2 ** max(0, len(down_blocks) - 1))
+    block_channels = getattr(unet.config, "block_out_channels", None)
+    if block_channels:
+        return max(8, 2 ** max(0, len(block_channels) - 1))
+    return 8
+
+
+def _aspect_output_size(unet, aspect_ratio="1:1 (Square)"):
+    """Return a skip-connection-safe width/height near the native pixel count."""
+    native_w, native_h = _get_model_sample_size(unet)
+    ratio_w, ratio_h = ASPECT_RATIOS.get(aspect_ratio, (1, 1))
+    target_pixels = max(64, native_w * native_h)
+    width = (target_pixels * ratio_w / ratio_h) ** 0.5
+    height = width * ratio_h / ratio_w
+
+    multiple = _get_unet_size_multiple(unet)
+    width = max(multiple, int(round(width / multiple)) * multiple)
+    height = max(multiple, int(round(height / multiple)) * multiple)
+    return width, height
+
+
+@synchronized_inference
+def generate_images(model_path_or_name: str, seed=None, num_inference_steps=50, batch_size=1, sampler="DDPM", aspect_ratio="1:1 (Square)"):
+
     """Run inference and return a list of PIL Images.
 
     Resolution is baked into the trained UNet sample_size, so the Generate tab
@@ -494,27 +562,28 @@ def generate_images(model_path_or_name: str, seed=None, num_inference_steps=50, 
     """
     import torch
 
-    pipeline = load_pipeline(model_path_or_name)
-    pipeline = apply_sampler_to_pipeline(pipeline, sampler=sampler)
-    device = next(pipeline.unet.parameters()).device
-    generator = None
-    if seed is not None:
-        # For a batch, make deterministic-but-different samples from the same seed.
-        generator = [torch.Generator(device=device).manual_seed(int(seed) + i) for i in range(int(batch_size))]
+    with PIPELINE_LOCK:
+        pipeline = load_pipeline(model_path_or_name)
+        pipeline = apply_sampler_to_pipeline(pipeline, sampler=sampler)
+        device = next(pipeline.unet.parameters()).device
+        dtype = next(pipeline.unet.parameters()).dtype
+        sample_w, sample_h = _aspect_output_size(pipeline.unet, aspect_ratio)
+        base_seed = int(seed) if seed is not None else random.randint(0, 2_147_483_647)
 
-    images = pipeline(
-        generator=generator,
-        batch_size=int(batch_size),
-        num_inference_steps=int(num_inference_steps),
-        output_type="pil",
-    ).images
-    return images
+        images = []
+        for i in range(int(batch_size)):
+            generator = torch.Generator(device=device).manual_seed(base_seed + i)
+            noise = torch.randn((1, 3, sample_h, sample_w), generator=generator, device=device, dtype=dtype)
+            image_tensor = _sample_with_pipeline_from_noise(pipeline, noise, num_inference_steps=num_inference_steps)
+            images.append(_model_tensor_to_pil(image_tensor))
+        return images
 
 
 def generate_image(model_path_or_name: str, seed=None, sampler="DDPM"):
     return generate_images(model_path_or_name, seed=seed, num_inference_steps=50, batch_size=1, sampler=sampler)[0]
 
 
+@synchronized_inference
 def generate_reference_images(
     model_path_or_name: str,
     reference_image_path: str,
@@ -523,6 +592,7 @@ def generate_reference_images(
     batch_size=1,
     sampler="DDPM",
     reference_strength=65,
+    aspect_ratio="1:1 (Square)",
 ):
     """Reimagine an uploaded reference image through the selected DDPM model.
 
@@ -537,37 +607,34 @@ def generate_reference_images(
     import torch
     from PIL import Image as PILImage
 
-    pipeline = load_pipeline(model_path_or_name)
-    pipeline = apply_sampler_to_pipeline(pipeline, sampler=sampler)
-    device = next(pipeline.unet.parameters()).device
-    dtype = next(pipeline.unet.parameters()).dtype
-    sample_w, sample_h = _get_model_sample_size(pipeline.unet)
+    with PIPELINE_LOCK:
+        pipeline = load_pipeline(model_path_or_name)
+        pipeline = apply_sampler_to_pipeline(pipeline, sampler=sampler)
+        device = next(pipeline.unet.parameters()).device
+        dtype = next(pipeline.unet.parameters()).dtype
+        sample_w, sample_h = _aspect_output_size(pipeline.unet, aspect_ratio)
 
-    reference_image = PILImage.open(reference_image_path).convert("RGB")
-    strength = max(0.0, min(1.0, float(reference_strength) / 100.0))
+        reference_image = PILImage.open(reference_image_path).convert("RGB")
+        strength = max(0.0, min(1.0, float(reference_strength) / 100.0))
+        if strength >= 0.999:
+            return [reference_image.resize((sample_w, sample_h), PILImage.BILINEAR) for _ in range(int(batch_size))]
 
-    # At the far right of the slider, make the behavior obvious: the reference
-    # is preserved instead of being slightly cooked by one final denoise step.
-    if strength >= 0.999:
-        return [reference_image.resize((sample_w, sample_h), PILImage.BILINEAR) for _ in range(int(batch_size))]
-
-    base_seed = int(seed) if seed is not None else random.randint(0, 2_147_483_647)
-    images = []
-    for i in range(int(batch_size)):
-        generator = torch.Generator(device=device).manual_seed(base_seed + i)
-        noise = torch.randn((1, 3, sample_h, sample_w), generator=generator, device=device, dtype=dtype)
-        noise = _normalize_noise_tensor(noise)
-        frame_tensor = _sample_with_pipeline_from_reference(
-            pipeline,
-            reference_image,
-            noise,
-            num_inference_steps=num_inference_steps,
-            reference_influence=strength,
-        )
-        images.append(_model_tensor_to_pil(frame_tensor))
-    return images
+        base_seed = int(seed) if seed is not None else random.randint(0, 2_147_483_647)
+        images = []
+        for i in range(int(batch_size)):
+            generator = torch.Generator(device=device).manual_seed(base_seed + i)
+            noise = torch.randn((1, 3, sample_h, sample_w), generator=generator, device=device, dtype=dtype)
+            noise = _normalize_noise_tensor(noise)
+            frame_tensor = _sample_with_pipeline_from_reference(
+                pipeline, reference_image, noise,
+                num_inference_steps=num_inference_steps,
+                reference_influence=strength,
+            )
+            images.append(_model_tensor_to_pil(frame_tensor))
+        return images
 
 
+@synchronized_inference
 def generate_masked_reference_image(
     model_path_or_name: str,
     source_image,
@@ -631,11 +698,13 @@ def _get_model_sample_size(unet):
 
 
 def _normalize_noise_tensor(noise):
-    import torch
-    flat = noise.view(noise.shape[0], -1)
-    denom = flat.norm(dim=1, keepdim=True).clamp_min(1e-8)
-    flat = flat / denom
-    return flat.view_as(noise)
+    # Diffusion expects Gaussian noise with roughly unit standard deviation.
+    # L2-normalizing the entire image made its std ~1/sqrt(C*H*W), effectively
+    # removing almost all noise from video/reference reconstruction.
+    dims = tuple(range(1, noise.ndim))
+    mean = noise.mean(dim=dims, keepdim=True)
+    std = noise.std(dim=dims, keepdim=True).clamp_min(1e-6)
+    return (noise - mean) / std
 
 
 def _pil_to_model_tensor(image, size, device, dtype):
@@ -665,13 +734,19 @@ def _model_tensor_to_pil(image_tensor):
 
 
 def _sample_with_pipeline_from_noise(pipeline, initial_noise, num_inference_steps=50):
-    image = initial_noise.clone()
-    scheduler = pipeline.scheduler
-    scheduler.set_timesteps(int(num_inference_steps))
-    for t in scheduler.timesteps:
-        model_output = pipeline.unet(image, t).sample
-        image = scheduler.step(model_output, t, image).prev_sample
-    return image
+    import torch
+
+    # This custom sampler bypasses DDPMPipeline.__call__, so explicitly disable
+    # autograd. Without inference_mode PyTorch retains a graph for every denoise
+    # step, causing VRAM usage to grow until long generations run out of memory.
+    with torch.inference_mode():
+        image = initial_noise.clone()
+        scheduler = pipeline.scheduler
+        scheduler.set_timesteps(int(num_inference_steps))
+        for t in scheduler.timesteps:
+            model_output = pipeline.unet(image, t).sample
+            image = scheduler.step(model_output, t, image).prev_sample
+        return image.detach()
 
 
 def _sample_with_pipeline_from_reference(pipeline, reference_image, initial_noise, num_inference_steps=50, reference_influence=0.6):
@@ -679,7 +754,8 @@ def _sample_with_pipeline_from_reference(pipeline, reference_image, initial_nois
 
     device = next(pipeline.unet.parameters()).device
     dtype = next(pipeline.unet.parameters()).dtype
-    sample_w, sample_h = _get_model_sample_size(pipeline.unet)
+    # Match the reference tensor to the actual rectangular noise canvas.
+    sample_h, sample_w = int(initial_noise.shape[-2]), int(initial_noise.shape[-1])
     reference_tensor = _pil_to_model_tensor(reference_image, (sample_w, sample_h), device, dtype)
 
     scheduler = pipeline.scheduler
@@ -700,11 +776,14 @@ def _sample_with_pipeline_from_reference(pipeline, reference_image, initial_nois
     else:
         start_t_tensor = start_t.reshape(1).to(device=device, dtype=torch.long)
 
-    image = scheduler.add_noise(reference_tensor, initial_noise, start_t_tensor)
-    for t in timesteps[start_index:]:
-        model_output = pipeline.unet(image, t).sample
-        image = scheduler.step(model_output, t, image).prev_sample
-    return image
+    # As above, this path is a hand-written inference loop and must not build
+    # training graphs across its denoising steps.
+    with torch.inference_mode():
+        image = scheduler.add_noise(reference_tensor, initial_noise, start_t_tensor)
+        for t in timesteps[start_index:]:
+            model_output = pipeline.unet(image, t).sample
+            image = scheduler.step(model_output, t, image).prev_sample
+        return image.detach()
 
 
 def sample_reference_video_frames(video_path, target_frames):
@@ -749,6 +828,7 @@ def sample_reference_video_frames(video_path, target_frames):
             pass
 
 
+@synchronized_inference
 def generate_video_frames(
     model_path_or_name: str,
     seconds=4.0,
@@ -1148,6 +1228,60 @@ def build_cuda_warning_text(report):
     return "\n".join(lines)
 
 
+
+def make_scrollable_frame(parent, background=BG, inner_style="Panel.TFrame", width=None):
+    """Return (outer, canvas, inner) for tabs/panels that may be taller than the window."""
+    outer = ttk.Frame(parent, style=inner_style)
+    outer.rowconfigure(0, weight=1)
+    outer.columnconfigure(0, weight=1)
+
+    canvas_kwargs = {"bg": background, "highlightthickness": 0, "bd": 0}
+    if width is not None:
+        canvas_kwargs["width"] = width
+    canvas = tk.Canvas(outer, **canvas_kwargs)
+    scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.grid(row=0, column=0, sticky="nsew")
+    scrollbar.grid(row=0, column=1, sticky="ns")
+
+    inner = ttk.Frame(canvas, style=inner_style)
+    window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+    def _sync_scrollregion(_event=None):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def _sync_width(event):
+        canvas.itemconfigure(window_id, width=event.width)
+
+    def _wheel(event):
+        if getattr(event, "num", None) == 4:
+            canvas.yview_scroll(-1, "units")
+        elif getattr(event, "num", None) == 5:
+            canvas.yview_scroll(1, "units")
+        else:
+            delta = -1 * int(event.delta / 120) if event.delta else 0
+            canvas.yview_scroll(delta, "units")
+        return "break"
+
+    def _bind_wheel(_event=None):
+        canvas.bind_all("<MouseWheel>", _wheel)
+        canvas.bind_all("<Button-4>", _wheel)
+        canvas.bind_all("<Button-5>", _wheel)
+
+    def _unbind_wheel(_event=None):
+        canvas.unbind_all("<MouseWheel>")
+        canvas.unbind_all("<Button-4>")
+        canvas.unbind_all("<Button-5>")
+
+    inner.bind("<Configure>", _sync_scrollregion)
+    canvas.bind("<Configure>", _sync_width)
+    outer.bind("<Enter>", _bind_wheel)
+    outer.bind("<Leave>", _unbind_wheel)
+    canvas.bind("<Enter>", _bind_wheel)
+    canvas.bind("<Leave>", _unbind_wheel)
+    return outer, canvas, inner
+
+
 # ----------------------------------------------------------------------------
 # Train tab
 # ----------------------------------------------------------------------------
@@ -1167,6 +1301,18 @@ class TrainTab(ttk.Frame):
         self.dataset_photo_ref = None
         self.conveyor_state = None
         self.conveyor_prefetch_thread = None
+        self.conveyor_prepare_lock = threading.Lock()
+        self._auto_output_enabled = True
+        self.factory_tick = 0
+        self.factory_speed = 1.0
+        self.factory_phase = "Idle"
+        self.factory_card_x = []
+        self.factory_thumbnails = []
+        self.factory_last_time = time.perf_counter()
+        try:
+            self.factory_gpu_name = get_cuda_startup_report().get("device_name") or "CPU"
+        except Exception:
+            self.factory_gpu_name = "GPU"
 
         self._build_ui()
         self.after(100, self._poll_queue)
@@ -1174,12 +1320,17 @@ class TrainTab(ttk.Frame):
     # -- UI construction -----------------------------------------------
     def _build_ui(self):
         self.columnconfigure(0, weight=1)
-        self.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
 
-        header = ttk.Label(self, text="Training settings", style="Heading.TLabel")
+        scroll_outer, self.train_scroll_canvas, content = make_scrollable_frame(self, background=BG, inner_style="Panel.TFrame")
+        scroll_outer.grid(row=0, column=0, sticky="nsew")
+        content.columnconfigure(0, weight=1)
+        content.columnconfigure(1, weight=1)
+
+        header = ttk.Label(content, text="Training settings", style="Heading.TLabel")
         header.grid(row=0, column=0, columnspan=2, sticky="w", padx=16, pady=(16, 8))
 
-        settings = ttk.Frame(self, style="Panel.TFrame")
+        settings = ttk.Frame(content, style="Panel.TFrame")
         settings.grid(row=1, column=0, columnspan=2, sticky="ew", padx=16)
         for c in range(3):
             settings.columnconfigure(c, weight=1, uniform="settings")
@@ -1205,6 +1356,18 @@ class TrainTab(ttk.Frame):
             settings, "Mixed precision", values=["fp16", "bf16", "no"], default="fp16",
             tooltip="fp16 speeds up training on most NVIDIA GPUs with little quality loss. "
                     "Use 'no' only if you hit numerical issues.",
+        )
+        self.tf32_mode = LabeledCombo(
+            settings, "TF32 compute", values=["Enabled", "Disabled"], default="Enabled", width=12,
+            tooltip="RTX 30-series and newer can use TF32 for faster fp32 math. Enabled is usually free speed; disable only when testing exact old behavior.",
+        )
+        self.noise_schedule = LabeledCombo(
+            settings, "Noise schedule", values=["Linear (classic)", "Cosine (structure)"], default="Linear (classic)", width=18,
+            tooltip="Linear is the original DDPM baseline. Cosine adds noise more gradually, keeping useful structure around longer during training.",
+        )
+        self.learning_efficiency = LabeledCombo(
+            settings, "Learning efficiency", values=["Normal", "Min-SNR 5.0"], default="Normal", width=14,
+            tooltip="Normal keeps the old loss. Min-SNR 5.0 reweights timesteps so training spends less effort fighting useless pure-static steps.",
         )
         self.preview_every = LabeledEntry(
             settings, "Preview every N epochs", default=5,
@@ -1245,19 +1408,22 @@ class TrainTab(ttk.Frame):
         self.batch_size.grid(row=0, column=2, sticky="ew", padx=6, pady=6)
         self.learning_rate.grid(row=1, column=0, sticky="ew", padx=6, pady=6)
         self.mixed_precision.grid(row=1, column=1, sticky="ew", padx=6, pady=6)
-        self.preview_every.grid(row=1, column=2, sticky="ew", padx=6, pady=6)
-        self.training_intensity.grid(row=2, column=0, columnspan=3, sticky="ew", padx=6, pady=(8, 2))
-        self.dataloader_workers.grid(row=3, column=0, sticky="ew", padx=6, pady=6)
-        self.gradient_accumulation.grid(row=3, column=1, sticky="ew", padx=6, pady=6)
-        self.preview_steps.grid(row=3, column=2, sticky="ew", padx=6, pady=6)
-        self.preview_sampler.grid(row=4, column=0, sticky="ew", padx=6, pady=6)
+        self.tf32_mode.grid(row=1, column=2, sticky="ew", padx=6, pady=6)
+        self.noise_schedule.grid(row=2, column=0, sticky="ew", padx=6, pady=6)
+        self.learning_efficiency.grid(row=2, column=1, sticky="ew", padx=6, pady=6)
+        self.preview_every.grid(row=2, column=2, sticky="ew", padx=6, pady=6)
+        self.training_intensity.grid(row=3, column=0, columnspan=3, sticky="ew", padx=6, pady=(8, 2))
+        self.dataloader_workers.grid(row=4, column=0, sticky="ew", padx=6, pady=6)
+        self.gradient_accumulation.grid(row=4, column=1, sticky="ew", padx=6, pady=6)
+        self.preview_steps.grid(row=4, column=2, sticky="ew", padx=6, pady=6)
+        self.preview_sampler.grid(row=5, column=0, sticky="ew", padx=6, pady=6)
         self.intensity_hint = ttk.Label(settings, text="", style="Meta.TLabel")
-        self.intensity_hint.grid(row=5, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 6))
+        self.intensity_hint.grid(row=6, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 6))
         self._update_intensity_hint()
 
         # Dataset folder picker
         data_row = ttk.Frame(settings, style="Panel.TFrame")
-        data_row.grid(row=6, column=0, columnspan=3, sticky="ew", padx=6, pady=6)
+        data_row.grid(row=7, column=0, columnspan=3, sticky="ew", padx=6, pady=6)
         ttk.Label(data_row, text="Dataset folder", style="Field.TLabel").pack(anchor="w")
         picker_row = ttk.Frame(data_row, style="Panel.TFrame")
         picker_row.pack(fill="x", pady=(2, 0))
@@ -1269,7 +1435,7 @@ class TrainTab(ttk.Frame):
         Tooltip(data_entry, "Folder containing your training images. The model name can auto-fill from this folder name.")
 
         conveyor_row = ttk.Frame(settings, style="Panel.TFrame")
-        conveyor_row.grid(row=7, column=0, columnspan=3, sticky="ew", padx=6, pady=(2, 6))
+        conveyor_row.grid(row=8, column=0, columnspan=3, sticky="ew", padx=6, pady=(2, 6))
         conveyor_row.columnconfigure(1, weight=1)
         self.dataset_conveyor_var = tk.BooleanVar(value=False)
         conveyor_check = ttk.Checkbutton(
@@ -1299,7 +1465,7 @@ class TrainTab(ttk.Frame):
         Tooltip(prefetch_check, "Keeps the next chunk ready while the current chunk trains. Uses disk links/copies, not full image RAM loading.")
 
         name_row = ttk.Frame(settings, style="Panel.TFrame")
-        name_row.grid(row=8, column=0, columnspan=3, sticky="ew", padx=6, pady=(2, 6))
+        name_row.grid(row=9, column=0, columnspan=3, sticky="ew", padx=6, pady=(2, 6))
         name_row.columnconfigure(1, weight=1)
         ttk.Label(name_row, text="Model name", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.model_name_var = tk.StringVar(value=self._suggest_model_name(DEFAULT_DATA_DIR))
@@ -1310,7 +1476,7 @@ class TrainTab(ttk.Frame):
 
         # Model loading / output saving
         model_row = ttk.Frame(settings, style="Panel.TFrame")
-        model_row.grid(row=9, column=0, columnspan=3, sticky="ew", padx=6, pady=(8, 2))
+        model_row.grid(row=10, column=0, columnspan=3, sticky="ew", padx=6, pady=(8, 2))
         model_row.columnconfigure(1, weight=1)
         ttk.Label(model_row, text="Start from trained model", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.base_model_var = tk.StringVar(value="")
@@ -1322,7 +1488,7 @@ class TrainTab(ttk.Frame):
         Tooltip(base_entry, "Optional: pick an older trained DDPMPipeline folder to continue/fine-tune from. Leave blank to train from scratch. Use Retrain Here to save the continued training back into the same model folder.")
 
         out_row = ttk.Frame(settings, style="Panel.TFrame")
-        out_row.grid(row=10, column=0, columnspan=3, sticky="ew", padx=6, pady=(2, 6))
+        out_row.grid(row=11, column=0, columnspan=3, sticky="ew", padx=6, pady=(2, 6))
         out_row.columnconfigure(1, weight=1)
         ttk.Label(out_row, text="Save training to", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.output_dir_var = tk.StringVar(value=str(DEFAULT_OUTPUT_DIR))
@@ -1330,9 +1496,11 @@ class TrainTab(ttk.Frame):
         out_entry.grid(row=0, column=1, sticky="ew")
         ttk.Button(out_row, text="Browse...", command=self._browse_output_dir, style="Secondary.TButton").grid(row=0, column=2, padx=(6, 0))
         Tooltip(out_entry, "This exact folder becomes the saved model folder. Use different folders for different experiments.")
+        self.model_name_var.trace_add("write", lambda *_: self._sync_output_to_model_name())
+        self._sync_output_to_model_name()
 
         # Advanced toggle (everything else keeps sane defaults under the hood)
-        adv_row = ttk.Frame(self, style="Panel.TFrame")
+        adv_row = ttk.Frame(content, style="Panel.TFrame")
         adv_row.grid(row=2, column=0, columnspan=2, sticky="w", padx=16, pady=(4, 12))
         self.use_ema_var = tk.BooleanVar(value=False)
         ema_check = ttk.Checkbutton(
@@ -1365,7 +1533,7 @@ class TrainTab(ttk.Frame):
         )
 
         # Start/stop controls
-        control_row = ttk.Frame(self, style="Panel.TFrame")
+        control_row = ttk.Frame(content, style="Panel.TFrame")
         control_row.grid(row=3, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 8))
         self.start_btn = ttk.Button(
             control_row, text="Start Training", command=self._on_start, style="Accent.TButton"
@@ -1382,9 +1550,9 @@ class TrainTab(ttk.Frame):
         self.save_btn.pack(side="left", padx=(8, 0))
 
         # Progress panel
-        progress_panel = ttk.Frame(self, style="Card.TFrame")
+        progress_panel = ttk.Frame(content, style="Card.TFrame")
         progress_panel.grid(row=4, column=0, columnspan=2, sticky="nsew", padx=16, pady=(8, 16))
-        self.rowconfigure(4, weight=1)
+        content.rowconfigure(4, weight=1)
         progress_panel.columnconfigure(0, weight=1)
         progress_panel.columnconfigure(1, weight=0)
 
@@ -1411,11 +1579,15 @@ class TrainTab(ttk.Frame):
             progress_panel, height=8, bg=BG_FIELD, fg=FG_DIM, insertbackground=FG,
             relief="flat", font=("Consolas", 9), wrap="word",
         )
-        self.log_text.grid(row=4, column=0, sticky="nsew", padx=14, pady=(0, 14))
-        progress_panel.rowconfigure(4, weight=1)
+        self.factory_canvas = tk.Canvas(progress_panel, height=220, bg="#151820", highlightthickness=0)
+        self.factory_canvas.grid(row=4, column=0, sticky="ew", padx=14, pady=(0, 8))
+        self.factory_canvas.bind("<Configure>", lambda _e: (self._ensure_factory_card_population(), self._draw_factory()))
+
+        self.log_text.grid(row=5, column=0, sticky="nsew", padx=14, pady=(0, 14))
+        progress_panel.rowconfigure(5, weight=1)
 
         preview_box = ttk.Frame(progress_panel, style="Card.TFrame")
-        preview_box.grid(row=0, column=1, rowspan=5, sticky="ns", padx=(0, 14), pady=14)
+        preview_box.grid(row=0, column=1, rowspan=6, sticky="ns", padx=(0, 14), pady=14)
         ttk.Label(preview_box, text="Training Preview", style="Meta.TLabel").pack(anchor="w", pady=(0, 6))
         self.preview_label = tk.Label(
             preview_box, text="Dataset examples and generated previews will appear here",
@@ -1424,6 +1596,143 @@ class TrainTab(ttk.Frame):
         )
         self.preview_label.pack(fill="both", expand=True)
         self.log_text.configure(state=tk.DISABLED)
+        self.after(33, self._animate_factory)
+
+    def _sync_output_to_model_name(self):
+        if not getattr(self, "_auto_output_enabled", False):
+            return
+        name = sanitize_filename_component(self.model_name_var.get(), fallback="DDPM Model")
+        self.output_dir_var.set(str(DEFAULT_MODELS_ROOT / name))
+
+    def _set_factory_dataset_images(self, paths):
+        """Cache tiny original/noisy/reconstructed thumbnails once per run."""
+        from PIL import Image as PILImage, ImageEnhance, ImageFilter, ImageOps, ImageTk
+
+        thumbs = []
+        for path in list(paths)[:6]:
+            try:
+                with PILImage.open(path) as opened:
+                    original = ImageOps.fit(opened.convert("RGB"), (68, 48), method=PILImage.BILINEAR)
+                # Fixed, cheap visual effects: no per-frame image processing.
+                static = PILImage.effect_noise(original.size, 72).convert("RGB")
+                noisy = PILImage.blend(original, static, 0.58)
+                pixelated = original.resize((17, 12), PILImage.BILINEAR).resize(original.size, PILImage.NEAREST)
+                messy = PILImage.blend(original, pixelated, 0.42)
+                messy = ImageEnhance.Color(messy).enhance(0.82).filter(ImageFilter.SMOOTH)
+                thumbs.append({
+                    "original": ImageTk.PhotoImage(original),
+                    "noisy": ImageTk.PhotoImage(noisy),
+                    "messy": ImageTk.PhotoImage(messy),
+                })
+            except Exception:
+                continue
+        self.factory_thumbnails = thumbs
+        self._reset_factory_cards()
+
+    def _factory_card_count(self):
+        """Enough cards to cover the full belt plus one offscreen at each end."""
+        import math
+        canvas = getattr(self, "factory_canvas", None)
+        width = max(640, canvas.winfo_width() if canvas is not None else 640)
+        spacing = 118
+        return max(8, int(math.ceil((width + spacing * 2) / spacing)))
+
+    def _reset_factory_cards(self):
+        """Populate the whole belt immediately so every processing stage is visible."""
+        spacing = 118.0
+        count = self._factory_card_count()
+        self.factory_card_x = [-92.0 + i * spacing for i in range(count)]
+
+    def _ensure_factory_card_population(self):
+        """Add cards after a window resize without disturbing existing motion."""
+        spacing = 118.0
+        target = self._factory_card_count()
+        if not self.factory_card_x:
+            self._reset_factory_cards()
+            return
+        while len(self.factory_card_x) < target:
+            self.factory_card_x.append(max(self.factory_card_x) + spacing)
+
+    def _draw_factory(self):
+        c = getattr(self, "factory_canvas", None)
+        if c is None:
+            return
+        c.delete("all")
+        w = max(640, c.winfo_width())
+        belt_top, belt_bottom = 123, 198
+        c.create_text(16, 14, anchor="nw", text="DDPM DREAM FACTORY", fill=FG, font=(FONT_FAMILY, 11, "bold"))
+        c.create_text(w - 16, 14, anchor="ne", text=self.factory_phase, fill=GOOD if self.training_active else FG_DIM, font=(FONT_FAMILY, 10, "bold"))
+        # GPU power unit and cable. Keep the device name inside its panel.
+        gpu_left = w - 162
+        c.create_line(gpu_left, 78, 545, 78, 545, 112, fill=ACCENT, width=3)
+        c.create_rectangle(gpu_left, 43, w - 12, 108, fill="#263248", outline=ACCENT, width=2)
+        fan_x = gpu_left + 34
+        c.create_oval(fan_x - 19, 53, fan_x + 19, 91, outline=GOOD, width=3)
+        angle = self.factory_tick * 0.35
+        import math as _math
+        for a in (0, 2.094, 4.188):
+            x2 = fan_x + 16 * _math.cos(angle + a); y2 = 72 + 16 * _math.sin(angle + a)
+            c.create_line(fan_x, 72, x2, y2, fill=GOOD, width=3)
+        gpu_name = str(getattr(self, "factory_gpu_name", "GPU"))
+        if len(gpu_name) > 23:
+            gpu_name = gpu_name[:22] + "…"
+        c.create_text(gpu_left + 61, 84, anchor="w", text=gpu_name, fill=FG, font=(FONT_FAMILY, 8, "bold"))
+        c.create_text(gpu_left + 61, 99, anchor="w", text="TRAINING POWER", fill=GOOD, font=(FONT_FAMILY, 7))
+
+        # Belt channel first, then cards, then machine shells. This makes cards
+        # genuinely travel through the machinery instead of floating over it.
+        c.create_rectangle(0, belt_top, w, belt_bottom, fill="#20252e", outline="#434a57", width=2)
+        c.create_line(0, belt_bottom - 10, w, belt_bottom - 10, fill="#555e6d", width=8)
+        for x in range(-40, w + 40, 42):
+            roller_x = x + ((self.factory_tick * self.factory_speed * 1.4) % 42)
+            c.create_oval(roller_x, belt_bottom - 19, roller_x + 18, belt_bottom - 1, fill="#69707c", outline="")
+
+        noisify = (180, 315)
+        denoise = (385, 520)
+        self._ensure_factory_card_population()
+        cards = self.factory_card_x
+        for index, x in enumerate(cards):
+            stage = "original"
+            # A card becomes noisy at the Noisify entrance and remains noisy
+            # throughout Denoise. The reconstructed version appears only after
+            # its left edge has completely reached the Denoise exit.
+            if noisify[0] <= x < denoise[1]:
+                stage = "noisy"
+            elif x >= denoise[1]:
+                stage = "messy"
+            if self.factory_thumbnails:
+                thumb = self.factory_thumbnails[index % len(self.factory_thumbnails)][stage]
+                c.create_rectangle(x - 3, 133, x + 71, 187, fill="#d8a45b", outline="#f0c77c", width=2)
+                c.create_image(x + 34, 160, image=thumb)
+            else:
+                c.create_rectangle(x, 137, x + 68, 184, fill="#d8a45b", outline="#f0c77c", width=2)
+                c.create_text(x + 34, 160, text="DATA", fill="#302719", font=(FONT_FAMILY, 8, "bold"))
+
+        # Draw shells last: side pillars hide cards as they cross the entrances,
+        # while the open middle window lets the processing state remain visible.
+        for (left, right), label, color in [(noisify, "NOISIFY", WARN), (denoise, "DENOISE", ACCENT)]:
+            c.create_rectangle(left, 55, right, 126, fill="#242934", outline=color, width=2)
+            c.create_rectangle(left, 121, left + 13, 199, fill="#242934", outline=color, width=2)
+            c.create_rectangle(right - 13, 121, right, 199, fill="#242934", outline=color, width=2)
+            c.create_text((left + right) / 2, 81, text=label, fill=FG, font=(FONT_FAMILY, 10, "bold"))
+            c.create_text((left + right) / 2, 103, text="PROCESSING" if self.training_active else "STANDBY", fill=color, font=(FONT_FAMILY, 8))
+            c.create_line(left + 13, 126, right - 13, 126, fill=color, width=2)
+
+    def _animate_factory(self):
+        now = time.perf_counter()
+        elapsed = min(0.1, max(0.0, now - self.factory_last_time))
+        self.factory_last_time = now
+        if self.training_active:
+            self.factory_tick += 1
+            w = max(640, getattr(self, "factory_canvas", None).winfo_width())
+            self._ensure_factory_card_population()
+            pixels_per_second = 42.0 + 38.0 * self.factory_speed
+            self.factory_card_x = [x + pixels_per_second * elapsed for x in self.factory_card_x]
+            for i, x in enumerate(self.factory_card_x):
+                if x > w + 85:
+                    self.factory_card_x[i] = min(self.factory_card_x) - 118.0
+            self._draw_factory()
+        self.after(33, self._animate_factory)
 
     def _get_intensity_description(self, intensity=None):
         intensity = int(intensity if intensity is not None else self.training_intensity.get())
@@ -1494,6 +1803,7 @@ class TrainTab(ttk.Frame):
             messagebox.showerror("Not a loadable model", describe_model_problem(Path(base_model)))
             return
 
+        self._auto_output_enabled = False
         self.base_model_var.set(str(resolved))
         self.output_dir_var.set(str(resolved))
         self.model_name_var.set(get_friendly_model_name(resolved))
@@ -1508,6 +1818,7 @@ class TrainTab(ttk.Frame):
     def _browse_output_dir(self):
         chosen = filedialog.askdirectory(initialdir=str(DEFAULT_MODELS_ROOT if DEFAULT_MODELS_ROOT.exists() else ROOT_DIR))
         if chosen:
+            self._auto_output_enabled = False
             self.output_dir_var.set(chosen)
 
     def _try_apply_model_resolution(self, model_dir: Path):
@@ -1692,6 +2003,9 @@ class TrainTab(ttk.Frame):
             "batch_size": batch_size,
             "learning_rate": lr,
             "mixed_precision": self.mixed_precision.get(),
+            "tf32": self.tf32_mode.get(),
+            "noise_schedule": self.noise_schedule.get(),
+            "learning_efficiency": self.learning_efficiency.get(),
             "preview_every": preview_every,
             "data_dir": str(data_dir),
             "output_dir": str(output_dir),
@@ -1729,6 +2043,8 @@ class TrainTab(ttk.Frame):
 
         self.training_active = True
         self.start_time = time.time()
+        self.factory_last_time = time.perf_counter()
+        self._reset_factory_cards()
         self.user_stopped = False
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
@@ -1758,6 +2074,21 @@ class TrainTab(ttk.Frame):
         self.status_label.config(text=f"Starting... {self._get_intensity_description(settings['training_intensity'])}")
         self._launch_training_command(cmd)
 
+    def _schedule_arg(self, label):
+        text = str(label or "").lower()
+        if "cosine" in text:
+            return "squaredcos_cap_v2"
+        return "linear"
+
+    def _snr_gamma_arg(self, label):
+        text = str(label or "").lower()
+        if "min-snr" in text or "snr" in text:
+            return 5.0
+        return None
+
+    def _tf32_enabled(self, label):
+        return str(label or "Enabled").lower() != "disabled"
+
     def _build_training_command(self, settings, train_data_dir, output_dir, num_epochs, base_model=""):
         cmd = [
             sys.executable, str(TRAIN_SCRIPT),
@@ -1769,6 +2100,8 @@ class TrainTab(ttk.Frame):
             "--num_epochs", str(num_epochs),
             "--learning_rate", str(settings["learning_rate"]),
             "--mixed_precision", settings["mixed_precision"],
+            "--ddpm_beta_schedule", self._schedule_arg(settings.get("noise_schedule", "Linear (classic)")),
+            "--tf32", "true" if self._tf32_enabled(settings.get("tf32", "Enabled")) else "false",
             "--save_images_epochs", str(settings.get("save_images_epochs", settings["preview_every"])),
             "--save_model_epochs", str(settings.get("save_model_epochs", settings["preview_every"])),
             "--training_intensity", str(settings["training_intensity"]),
@@ -1780,6 +2113,9 @@ class TrainTab(ttk.Frame):
             "--stop_signal_file", str(self.stop_signal_file),
             "--gui_progress",
         ]
+        snr_gamma = self._snr_gamma_arg(settings.get("learning_efficiency", "Normal"))
+        if snr_gamma is not None:
+            cmd.extend(["--snr_gamma", str(snr_gamma)])
         if settings["storage_saver"]:
             cmd.extend([
                 "--storage_saver", "true",
@@ -1845,6 +2181,10 @@ class TrainTab(ttk.Frame):
                 shutil.copy2(src, dst)
 
     def _prepare_conveyor_chunk(self, chunk_index):
+        with self.conveyor_prepare_lock:
+            return self._prepare_conveyor_chunk_locked(chunk_index)
+
+    def _prepare_conveyor_chunk_locked(self, chunk_index):
         state = self.conveyor_state
         if not state:
             return None
@@ -2044,7 +2384,9 @@ class TrainTab(ttk.Frame):
             usable = evt.get("usable_images", 0)
             total = evt.get("total_files", 0)
             self._append_log(f"Dataset scan: {usable} usable image(s) out of {total} file(s).")
-            self._show_dataset_examples(evt.get("example_images") or [])
+            example_images = evt.get("example_images") or []
+            self._show_dataset_examples(example_images)
+            self._set_factory_dataset_images(example_images)
         elif kind == "hardware_warning":
             message = evt.get("message") or CUDA_CPU_WARNING_MESSAGE
             self._append_log(f"WARNING: {message}")
@@ -2065,6 +2407,8 @@ class TrainTab(ttk.Frame):
             self.total_epochs = evt.get("num_epochs")
             intensity = evt.get("training_intensity", "?")
             self.status_label.config(text=f"Training started ({total_epochs} epochs) at {intensity}% intensity...")
+            self.factory_phase = "Loading images"
+            self.factory_speed = max(0.35, min(3.0, float(intensity) / 50.0))
             self.epoch_label.config(text=f"Epoch: 0 / {total_epochs}")
             self._append_log(f"Training intensity: {intensity}% | GPU breather sleep ratio: {evt.get('throttle_sleep_ratio', 0):.2f}x step time")
         elif kind == "step":
@@ -2081,6 +2425,7 @@ class TrainTab(ttk.Frame):
             eta = format_eta(evt.get("eta_seconds"))
             self.eta_label.config(text=eta)
             self.status_label.config(text="Training...")
+            self.factory_phase = "Noisify → Denoise"
         elif kind == "epoch_end":
             eta = format_eta(evt.get("eta_seconds"))
             self.eta_label.config(text=eta)
@@ -2088,6 +2433,7 @@ class TrainTab(ttk.Frame):
                 f"-- Epoch {evt.get('epoch')} finished in {evt.get('epoch_duration_seconds', 0):.1f}s --"
             )
         elif kind == "preview_image":
+            self.factory_phase = "Quality inspection"
             path = evt.get("path")
             if path:
                 self._show_preview_image(path, caption=f"Generated preview - epoch {evt.get('epoch')}")
@@ -2113,6 +2459,7 @@ class TrainTab(ttk.Frame):
             self.eta_label.config(text="Stopped")
             self._finish_training(success=True)
         elif kind == "done":
+            self.factory_phase = "Model packaged!"
             if self.conveyor_state:
                 self.status_label.config(text="Dataset Conveyor chunk finished; preparing next chunk...")
             else:
@@ -2333,6 +2680,12 @@ class GenerateTab(ttk.Frame):
             tooltip="Generate several dream samples at once. Uses more VRAM while generating."
         )
         self.batch_count.pack(fill="x", padx=12, pady=6)
+
+        self.aspect_ratio = LabeledCombo(
+            controls, "Aspect ratio", values=list(ASPECT_RATIOS.keys()), default="1:1 (Square)", width=22,
+            tooltip="Changes the generated canvas shape while keeping roughly the same pixel workload. Existing square-trained models remain usable."
+        )
+        self.aspect_ratio.pack(fill="x", padx=12, pady=6)
 
         self.display_size = LabeledCombo(
             controls, "Preview size", values=["256", "384", "512", "768"], default="512", width=8,
@@ -2645,6 +2998,7 @@ class GenerateTab(ttk.Frame):
             "preview_size": preview_size,
             "reference_image_path": reference_image_path,
             "reference_strength": self.reference_strength.get() if hasattr(self, "reference_strength") else 0,
+            "aspect_ratio": self.aspect_ratio.get() if hasattr(self, "aspect_ratio") else "1:1 (Square)",
         }
 
     def _on_generate(self):
@@ -2678,6 +3032,7 @@ class GenerateTab(ttk.Frame):
                         batch_size=settings["batch_count"],
                         sampler=settings["sampler"],
                         reference_strength=settings["reference_strength"],
+                        aspect_ratio=settings["aspect_ratio"],
                     )
                 else:
                     images = generate_images(
@@ -2686,6 +3041,7 @@ class GenerateTab(ttk.Frame):
                         num_inference_steps=settings["steps"],
                         batch_size=settings["batch_count"],
                         sampler=settings["sampler"],
+                        aspect_ratio=settings["aspect_ratio"],
                     )
                 from PIL import Image as PILImage, ImageTk
 
@@ -3386,8 +3742,10 @@ class VideoTab(ttk.Frame):
 class App:
     def __init__(self, root):
         self.root = root
+        self._settings_cache = self._load_settings_file()
+        self._settings_save_after_id = None
         root.title("Diffusion Styler")
-        root.geometry("980x840")
+        root.geometry(self._settings_cache.get("window_geometry", "980x840"))
         root.minsize(820, 680)
         root.configure(bg=BG)
 
@@ -3407,10 +3765,214 @@ class App:
         notebook.add(self.video_tab, text="  Video  ")
         self.notebook = notebook
 
+        self._restore_tab_settings()
+        self._wire_settings_autosave()
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+
         # Warn immediately when PyTorch cannot use CUDA. This prevents users
         # with unsupported/very old GPUs from thinking the app is broken after
         # a slow CPU-only training run or a mysterious exit code 1.
         root.after(350, self._show_cuda_warning_if_needed)
+
+    def _load_settings_file(self):
+        try:
+            if APP_SETTINGS_FILE.exists():
+                data = json.loads(APP_SETTINGS_FILE.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+        return {}
+
+    def schedule_settings_save(self):
+        if self._settings_save_after_id is not None:
+            try:
+                self.root.after_cancel(self._settings_save_after_id)
+            except Exception:
+                pass
+        self._settings_save_after_id = self.root.after(600, self.save_ui_settings)
+
+    def _get_var_value(self, obj, default=None):
+        try:
+            if hasattr(obj, "var"):
+                return obj.var.get()
+            if hasattr(obj, "get"):
+                return obj.get()
+        except Exception:
+            pass
+        return default
+
+    def _set_var_value(self, obj, value):
+        if value is None:
+            return
+        try:
+            if hasattr(obj, "var"):
+                # Keep read-only comboboxes inside their allowed value list.
+                combo_values = getattr(obj, "children", {})
+                if hasattr(obj, "var") and hasattr(obj, "get"):
+                    pass
+                obj.var.set(value)
+                if hasattr(obj, "value_label"):
+                    obj.value_label.config(text=str(obj.get()))
+                return
+            if hasattr(obj, "set"):
+                obj.set(value)
+        except Exception:
+            pass
+
+    def _collect_tab_settings(self):
+        train = self.train_tab
+        generate = self.generate_tab
+        selected_model_path = generate.last_model_path or generate.get_selected_model_path()
+        return {
+            "version": 1,
+            "saved_at": time.time(),
+            "window_geometry": self.root.geometry(),
+            "train": {
+                "epochs": self._get_var_value(train.epochs),
+                "resolution": self._get_var_value(train.resolution),
+                "batch_size": self._get_var_value(train.batch_size),
+                "learning_rate": self._get_var_value(train.learning_rate),
+                "mixed_precision": self._get_var_value(train.mixed_precision),
+                "tf32_mode": self._get_var_value(train.tf32_mode),
+                "noise_schedule": self._get_var_value(train.noise_schedule),
+                "learning_efficiency": self._get_var_value(train.learning_efficiency),
+                "preview_every": self._get_var_value(train.preview_every),
+                "training_intensity": self._get_var_value(train.training_intensity),
+                "dataloader_workers": self._get_var_value(train.dataloader_workers),
+                "gradient_accumulation": self._get_var_value(train.gradient_accumulation),
+                "preview_steps": self._get_var_value(train.preview_steps),
+                "preview_sampler": self._get_var_value(train.preview_sampler),
+                "data_dir": train.data_dir_var.get(),
+                "dataset_conveyor": train.dataset_conveyor_var.get(),
+                "conveyor_chunks": self._get_var_value(train.conveyor_chunks),
+                "conveyor_prefetch": train.conveyor_prefetch_var.get(),
+                # Model identity/path fields intentionally do not persist: stale
+                # paths caused new names to overwrite or continue old models.
+                "use_ema": train.use_ema_var.get(),
+                "storage_saver": train.storage_saver_var.get(),
+                "pin_memory": train.pin_memory_var.get(),
+            },
+            "generate": {
+                "prompt": generate.prompt_var.get(),
+                "selected_model_path": selected_model_path,
+                "preset": self._get_var_value(generate.preset),
+                "steps": self._get_var_value(generate.steps),
+                "sampler": self._get_var_value(generate.sampler),
+                "batch_count": self._get_var_value(generate.batch_count),
+                "display_size": self._get_var_value(generate.display_size),
+                "seed": generate.seed_var.get(),
+                "reference_image": generate.reference_image_var.get(),
+                "reference_strength": self._get_var_value(generate.reference_strength),
+                "image_output_dir": generate.image_output_dir_var.get(),
+            },
+        }
+
+    def save_ui_settings(self):
+        self._settings_save_after_id = None
+        try:
+            data = self._collect_tab_settings()
+            APP_SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            self._settings_cache = data
+        except Exception:
+            pass
+
+    def _restore_tab_settings(self):
+        data = self._settings_cache if isinstance(self._settings_cache, dict) else {}
+        train_data = data.get("train") if isinstance(data.get("train"), dict) else {}
+        gen_data = data.get("generate") if isinstance(data.get("generate"), dict) else {}
+        train = self.train_tab
+        generate = self.generate_tab
+
+        for attr, key in [
+            ("epochs", "epochs"), ("resolution", "resolution"), ("batch_size", "batch_size"),
+            ("learning_rate", "learning_rate"), ("mixed_precision", "mixed_precision"),
+            ("tf32_mode", "tf32_mode"), ("noise_schedule", "noise_schedule"),
+            ("learning_efficiency", "learning_efficiency"), ("preview_every", "preview_every"),
+            ("training_intensity", "training_intensity"), ("dataloader_workers", "dataloader_workers"),
+            ("gradient_accumulation", "gradient_accumulation"), ("preview_steps", "preview_steps"),
+            ("preview_sampler", "preview_sampler"), ("conveyor_chunks", "conveyor_chunks"),
+        ]:
+            self._set_var_value(getattr(train, attr, None), train_data.get(key))
+
+        for var_name, key in [
+            ("data_dir_var", "data_dir"),
+        ]:
+            value = train_data.get(key)
+            if value is not None:
+                getattr(train, var_name).set(value)
+
+        for var_name, key in [
+            ("dataset_conveyor_var", "dataset_conveyor"), ("conveyor_prefetch_var", "conveyor_prefetch"),
+            ("use_ema_var", "use_ema"), ("storage_saver_var", "storage_saver"),
+            ("pin_memory_var", "pin_memory"),
+        ]:
+            value = train_data.get(key)
+            if value is not None:
+                getattr(train, var_name).set(bool(value))
+        train._update_intensity_hint()
+
+        # Restore generation settings. Apply preset first, then steps afterward so the saved custom step count wins.
+        self._set_var_value(generate.preset, gen_data.get("preset"))
+        self._set_var_value(generate.steps, gen_data.get("steps"))
+        self._set_var_value(generate.sampler, gen_data.get("sampler"))
+        self._set_var_value(generate.batch_count, gen_data.get("batch_count"))
+        self._set_var_value(generate.display_size, gen_data.get("display_size"))
+        self._set_var_value(generate.reference_strength, gen_data.get("reference_strength"))
+        for var_name, key in [
+            ("prompt_var", "prompt"), ("seed_var", "seed"),
+            ("reference_image_var", "reference_image"), ("image_output_dir_var", "image_output_dir"),
+        ]:
+            value = gen_data.get(key)
+            if value is not None:
+                getattr(generate, var_name).set(value)
+        generate._update_sampler_hint()
+        generate._update_prompt_match_preview()
+
+        saved_model = gen_data.get("selected_model_path")
+        if saved_model:
+            for key, path in generate._checkpoint_paths.items():
+                try:
+                    if str(Path(path)) == str(Path(saved_model)):
+                        generate._select_model_key(key)
+                        break
+                except Exception:
+                    pass
+
+    def _trace_var(self, var):
+        try:
+            var.trace_add("write", lambda *_: self.schedule_settings_save())
+        except Exception:
+            pass
+
+    def _wire_settings_autosave(self):
+        train = self.train_tab
+        generate = self.generate_tab
+        objects_with_vars = [
+            train.epochs, train.resolution, train.batch_size, train.learning_rate,
+            train.mixed_precision, train.tf32_mode, train.noise_schedule, train.learning_efficiency,
+            train.preview_every, train.training_intensity, train.dataloader_workers,
+            train.gradient_accumulation, train.preview_steps, train.preview_sampler, train.conveyor_chunks,
+            generate.preset, generate.steps, generate.sampler, generate.batch_count,
+            generate.display_size, generate.reference_strength,
+        ]
+        direct_vars = [
+            train.data_dir_var, train.dataset_conveyor_var, train.conveyor_prefetch_var,
+            train.model_name_var, train.base_model_var, train.output_dir_var,
+            train.use_ema_var, train.storage_saver_var, train.pin_memory_var,
+            generate.prompt_var, generate.seed_var, generate.reference_image_var,
+            generate.image_output_dir_var,
+        ]
+        for obj in objects_with_vars:
+            if hasattr(obj, "var"):
+                self._trace_var(obj.var)
+        for var in direct_vars:
+            self._trace_var(var)
+        generate.model_tree.bind("<<TreeviewSelect>>", lambda _event: self.schedule_settings_save(), add="+")
+
+    def _on_close(self):
+        self.save_ui_settings()
+        self.root.destroy()
 
     def _show_cuda_warning_if_needed(self):
         report = get_cuda_startup_report()

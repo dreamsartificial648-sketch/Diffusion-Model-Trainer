@@ -255,6 +255,9 @@ def write_model_info(args, epoch=None, stopped=False):
         "learning_rate": args.learning_rate,
         "mixed_precision": args.mixed_precision,
         "training_intensity": getattr(args, "training_intensity", 100),
+        "ddpm_beta_schedule": getattr(args, "ddpm_beta_schedule", "linear"),
+        "snr_gamma": getattr(args, "snr_gamma", None),
+        "tf32": bool(getattr(args, "tf32", True)),
         "epoch": epoch,
         "stopped": bool(stopped),
         "training_mode": "continue_finetune" if continued_from else "fresh",
@@ -608,7 +611,19 @@ def parse_args():
         choices=["DDPM", "DDIM"],
         help="Sampler used only for in-training preview images. DDIM is usually faster; DDPM is the classic baseline.",
     )
-    parser.add_argument("--ddpm_beta_schedule", type=str, default="linear")
+    parser.add_argument(
+        "--ddpm_beta_schedule",
+        type=str,
+        default="linear",
+        choices=["linear", "scaled_linear", "squaredcos_cap_v2", "sigmoid"],
+        help="Noise schedule for training. Use linear for the classic baseline or squaredcos_cap_v2 for a cosine schedule that preserves structure longer.",
+    )
+    parser.add_argument(
+        "--snr_gamma",
+        type=float,
+        default=None,
+        help="Optional Min-SNR loss weighting gamma. 5.0 is a good practical starting point; None disables it for classic DDPM training.",
+    )
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
@@ -937,11 +952,13 @@ def main(args):
         pin_memory=bool(args.pin_memory and torch.cuda.is_available()),
     )
 
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    max_train_steps = args.num_epochs * num_update_steps_per_epoch
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=len(train_dataloader) * args.num_epochs,
+        num_warmup_steps=min(args.lr_warmup_steps, max_train_steps),
+        num_training_steps=max_train_steps,
     )
 
     model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -969,6 +986,9 @@ def main(args):
     logger.info(f"  Pin memory = {bool(args.pin_memory and torch.cuda.is_available())}")
     logger.info(f"  Preview inference steps = {args.preview_num_inference_steps}")
     logger.info(f"  Preview sampler = {args.preview_sampler}")
+    logger.info(f"  DDPM noise schedule = {args.ddpm_beta_schedule}")
+    logger.info(f"  Min-SNR gamma = {args.snr_gamma if args.snr_gamma is not None else 'off'}")
+    logger.info(f"  TF32 = {'on' if args.tf32 else 'off'}")
     logger.info(f"  Total optimization steps = {max_train_steps}")
     throttle_sleep_ratio = training_intensity_sleep_ratio(args.training_intensity)
     logger.info(f"  Training intensity = {args.training_intensity}% (cooldown sleep ratio {throttle_sleep_ratio:.2f}x step time)")
@@ -987,6 +1007,9 @@ def main(args):
         effective_batch_size=total_batch_size,
         preview_num_inference_steps=args.preview_num_inference_steps,
         preview_sampler=args.preview_sampler,
+        ddpm_beta_schedule=args.ddpm_beta_schedule,
+        snr_gamma=args.snr_gamma,
+        tf32=bool(args.tf32),
     )
 
     global_step = 0
@@ -1072,7 +1095,15 @@ def main(args):
                 model_output = model(noisy_images, timesteps).sample
 
                 if args.prediction_type == "epsilon":
-                    loss = F.mse_loss(model_output.float(), noise.float())
+                    loss = F.mse_loss(model_output.float(), noise.float(), reduction="none")
+                    if args.snr_gamma is not None and args.snr_gamma > 0:
+                        alpha_t = _extract_into_tensor(
+                            noise_scheduler.alphas_cumprod, timesteps, loss.shape
+                        )
+                        snr = alpha_t / (1.0 - alpha_t).clamp_min(1e-8)
+                        snr_weight = torch.clamp(snr, max=float(args.snr_gamma)) / snr.clamp_min(1e-8)
+                        loss = loss * snr_weight
+                    loss = loss.mean()
                 elif args.prediction_type == "sample":
                     alpha_t = _extract_into_tensor(
                         noise_scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1)
@@ -1170,7 +1201,7 @@ def main(args):
             )
 
         if accelerator.is_main_process:
-            if epoch % args.save_images_epochs == 0 or epoch == args.num_epochs - 1:
+            if (epoch + 1) % args.save_images_epochs == 0 or epoch == args.num_epochs - 1:
                 unet = accelerator.unwrap_model(model)
                 if args.use_ema:
                     ema_model.store(unet.parameters())
@@ -1179,23 +1210,26 @@ def main(args):
                 preview_scheduler = make_preview_scheduler(noise_scheduler, args.preview_sampler)
                 pipeline = DDPMPipeline(unet=unet, scheduler=preview_scheduler)
                 generator = torch.Generator(device=pipeline.device).manual_seed(0)
-                images = pipeline(
-                    generator=generator,
-                    batch_size=args.eval_batch_size,
-                    num_inference_steps=args.preview_num_inference_steps,
-                    output_type="np",
-                ).images
+                try:
+                    images = pipeline(generator=generator, batch_size=1,
+                                      num_inference_steps=args.preview_num_inference_steps,
+                                      output_type="np").images
+                except torch.cuda.OutOfMemoryError:
+                    logger.warning("Skipped training preview because VRAM was full; training will continue.")
+                    torch.cuda.empty_cache()
+                    images = None
 
                 if args.use_ema:
                     ema_model.restore(unet.parameters())
 
-                images_processed = (images * 255).round().astype("uint8")
-                save_preview_grid(images, args.output_dir, epoch, gui_progress=args.gui_progress)
-                if args.logger == "tensorboard":
+                if images is not None:
+                    images_processed = (images * 255).round().astype("uint8")
+                    save_preview_grid(images, args.output_dir, epoch, gui_progress=args.gui_progress)
+                if images is not None and args.logger == "tensorboard":
                     tracker = accelerator.get_tracker("tensorboard", unwrap=True)
                     tracker.add_images("test_samples", images_processed.transpose(0, 3, 1, 2), epoch)
 
-            if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
+            if (epoch + 1) % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
                 pipeline = save_pipeline_snapshot(
                     accelerator, model, noise_scheduler, args, ema_model if args.use_ema else None, epoch=epoch
                 )
