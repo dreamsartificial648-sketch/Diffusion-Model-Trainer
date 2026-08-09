@@ -48,6 +48,22 @@ def emit_progress(enabled, **fields):
     print(f"PROGRESS_JSON:{json.dumps(payload)}", flush=True)
 
 
+def remove_checkpoint_safely(path):
+    """Best-effort checkpoint pruning that tolerates short-lived Windows handles."""
+    for attempt in range(8):
+        try:
+            shutil.rmtree(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            if attempt == 7:
+                logger.warning("Keeping old checkpoint %s after cleanup failure: %s", path, exc)
+                return False
+            time.sleep(0.35 * (attempt + 1))
+    return False
+
+
 def training_intensity_sleep_ratio(intensity):
     """Return a soft cooldown pause ratio for each optimizer step.
 
@@ -273,7 +289,12 @@ def write_model_info(args, epoch=None, stopped=False):
         return None
 
 
-def cleanup_training_artifacts(output_dir, gui_progress=False, keep_latest_checkpoint=False):
+def cleanup_training_artifacts(
+    output_dir,
+    gui_progress=False,
+    keep_latest_checkpoint=False,
+    remove_logs=False,
+):
     """Delete heavy training-only artifacts while keeping the loadable pipeline.
 
     The final Diffusers pipeline only needs model_index.json, scheduler/, and unet/.
@@ -298,12 +319,14 @@ def cleanup_training_artifacts(output_dir, gui_progress=False, keep_latest_check
 
     trash_targets = list(checkpoints)
 
-    # TensorBoard/W&B logs are useful while debugging, but not needed for generating.
-    # Keep GUI previews because they are tiny and useful to inspect model history.
-    for name in ["logs", "runs", "wandb", "gui_stop_training.flag"]:
-        p = output_dir / name
-        if p.exists():
-            trash_targets.append(p)
+    # A snapshot can be saved while TensorBoard is still writing. Do not remove
+    # live logs during that stage or its background writer will crash on Windows.
+    # Logs may be removed only after training has fully ended.
+    if remove_logs:
+        for name in ["logs", "runs", "wandb", "gui_stop_training.flag"]:
+            p = output_dir / name
+            if p.exists():
+                trash_targets.append(p)
 
     for target in trash_targets:
         try:
@@ -1140,7 +1163,7 @@ def main(args):
                             )
                             if len(checkpoints) >= args.checkpoints_total_limit:
                                 for cp in checkpoints[: len(checkpoints) - args.checkpoints_total_limit + 1]:
-                                    shutil.rmtree(os.path.join(args.output_dir, cp))
+                                    remove_checkpoint_safely(os.path.join(args.output_dir, cp))
 
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
@@ -1252,6 +1275,7 @@ def main(args):
             args.output_dir,
             gui_progress=args.gui_progress,
             keep_latest_checkpoint=args.keep_latest_resume_checkpoint,
+            remove_logs=True,
         )
     emit_progress(args.gui_progress and accelerator.is_main_process, event="done", output_dir=args.output_dir)
 

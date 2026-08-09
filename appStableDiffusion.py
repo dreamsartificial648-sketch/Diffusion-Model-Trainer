@@ -46,6 +46,8 @@ FONT_FAMILY = "Segoe UI"
 # ----------------------------------------------------------------------------
 ROOT_DIR = Path(__file__).resolve().parent
 TRAIN_SCRIPT = ROOT_DIR / "train.py"
+AUDIO_TRAIN_SCRIPT = ROOT_DIR / "audio_train.py"
+AUDIO_GENERATE_SCRIPT = ROOT_DIR / "audio_generate.py"
 if not TRAIN_SCRIPT.exists():
     # Chat/download copies are sometimes numbered (train(31).py). Accept the
     # newest numbered copy so the GUI does not fail merely because of its name.
@@ -552,13 +554,37 @@ def _aspect_output_size(unet, aspect_ratio="1:1 (Square)"):
     return width, height
 
 
+def _output_size(unet, aspect_ratio="1:1 (Square)", width=None, height=None):
+    """Return a UNet-safe canvas plus the exact requested output size."""
+    if width is None and height is None:
+        canvas_w, canvas_h = _aspect_output_size(unet, aspect_ratio)
+        return canvas_w, canvas_h, canvas_w, canvas_h
+    if width is None or height is None:
+        raise ValueError("Custom DDPM size requires both width and height.")
+    width, height = int(width), int(height)
+    multiple = _get_unet_size_multiple(unet)
+    if not 64 <= width <= 2048 or not 64 <= height <= 2048:
+        raise ValueError("Custom DDPM dimensions must be between 64 and 2048 pixels.")
+    # DDPM UNets need a compatible internal canvas.  Pad to the next safe
+    # multiple and crop the finished image back to the user's exact size.
+    canvas_w = ((width + multiple - 1) // multiple) * multiple
+    canvas_h = ((height + multiple - 1) // multiple) * multiple
+    return canvas_w, canvas_h, width, height
+
+
+def _crop_to_output_size(image, width, height):
+    left = max(0, (image.width - width) // 2)
+    top = max(0, (image.height - height) // 2)
+    return image.crop((left, top, left + width, top + height))
+
+
 @synchronized_inference
-def generate_images(model_path_or_name: str, seed=None, num_inference_steps=50, batch_size=1, sampler="DDPM", aspect_ratio="1:1 (Square)"):
+def generate_images(model_path_or_name: str, seed=None, num_inference_steps=50, batch_size=1, sampler="DDPM", aspect_ratio="1:1 (Square)", width=None, height=None):
 
     """Run inference and return a list of PIL Images.
 
-    Resolution is baked into the trained UNet sample_size, so the Generate tab
-    shows it as model info instead of pretending it can be changed safely.
+    The default size preserves the model's native pixel count. Custom dimensions
+    are accepted when they meet the UNet's down/up-sampling size multiple.
     """
     import torch
 
@@ -567,7 +593,7 @@ def generate_images(model_path_or_name: str, seed=None, num_inference_steps=50, 
         pipeline = apply_sampler_to_pipeline(pipeline, sampler=sampler)
         device = next(pipeline.unet.parameters()).device
         dtype = next(pipeline.unet.parameters()).dtype
-        sample_w, sample_h = _aspect_output_size(pipeline.unet, aspect_ratio)
+        sample_w, sample_h, output_w, output_h = _output_size(pipeline.unet, aspect_ratio, width, height)
         base_seed = int(seed) if seed is not None else random.randint(0, 2_147_483_647)
 
         images = []
@@ -575,7 +601,7 @@ def generate_images(model_path_or_name: str, seed=None, num_inference_steps=50, 
             generator = torch.Generator(device=device).manual_seed(base_seed + i)
             noise = torch.randn((1, 3, sample_h, sample_w), generator=generator, device=device, dtype=dtype)
             image_tensor = _sample_with_pipeline_from_noise(pipeline, noise, num_inference_steps=num_inference_steps)
-            images.append(_model_tensor_to_pil(image_tensor))
+            images.append(_crop_to_output_size(_model_tensor_to_pil(image_tensor), output_w, output_h))
         return images
 
 
@@ -593,6 +619,8 @@ def generate_reference_images(
     sampler="DDPM",
     reference_strength=65,
     aspect_ratio="1:1 (Square)",
+    width=None,
+    height=None,
 ):
     """Reimagine an uploaded reference image through the selected DDPM model.
 
@@ -612,12 +640,12 @@ def generate_reference_images(
         pipeline = apply_sampler_to_pipeline(pipeline, sampler=sampler)
         device = next(pipeline.unet.parameters()).device
         dtype = next(pipeline.unet.parameters()).dtype
-        sample_w, sample_h = _aspect_output_size(pipeline.unet, aspect_ratio)
+        sample_w, sample_h, output_w, output_h = _output_size(pipeline.unet, aspect_ratio, width, height)
 
         reference_image = PILImage.open(reference_image_path).convert("RGB")
         strength = max(0.0, min(1.0, float(reference_strength) / 100.0))
         if strength >= 0.999:
-            return [reference_image.resize((sample_w, sample_h), PILImage.BILINEAR) for _ in range(int(batch_size))]
+            return [reference_image.resize((output_w, output_h), PILImage.BILINEAR) for _ in range(int(batch_size))]
 
         base_seed = int(seed) if seed is not None else random.randint(0, 2_147_483_647)
         images = []
@@ -630,7 +658,7 @@ def generate_reference_images(
                 num_inference_steps=num_inference_steps,
                 reference_influence=strength,
             )
-            images.append(_model_tensor_to_pil(frame_tensor))
+            images.append(_crop_to_output_size(_model_tensor_to_pil(frame_tensor), output_w, output_h))
         return images
 
 
@@ -656,13 +684,19 @@ def generate_masked_reference_image(
     sample_w, sample_h = _get_model_sample_size(pipeline.unet)
 
     source = source_image.convert("RGB")
-    source_model = source.resize((sample_w, sample_h), PILImage.BILINEAR)
-    mask_model = mask_image.convert("L").resize((sample_w, sample_h), PILImage.BILINEAR)
+    # DDPMs work at their trained resolution, but do not use that reduced copy
+    # as the final canvas.  Keeping the original source for compositing means
+    # pixels outside the painted area retain their original sharpness.
+    source_model = source.resize((sample_w, sample_h), PILImage.LANCZOS)
+    # Keep the blend mask at source resolution.  Blurring after shrinking to a
+    # 128px model canvas made even modest softness values expand into a huge,
+    # translucent wash when the result was enlarged again.
+    mask_full = mask_image.convert("L")
     blur = max(0, int(mask_blur))
     if blur:
-        mask_model = mask_model.filter(ImageFilter.GaussianBlur(radius=blur))
+        mask_full = mask_full.filter(ImageFilter.GaussianBlur(radius=blur))
 
-    mask_arr = np.asarray(mask_model).astype("float32") / 255.0
+    mask_arr = np.asarray(mask_full).astype("float32") / 255.0
     if float(mask_arr.max()) <= 0:
         raise RuntimeError("Paint a mask before reimagining.")
     mask_arr = np.clip(mask_arr, 0.0, 1.0)
@@ -682,12 +716,15 @@ def generate_masked_reference_image(
     )
     generated = _model_tensor_to_pil(generated_tensor).convert("RGB")
 
-    source_arr = np.asarray(source_model).astype("float32")
-    generated_arr = np.asarray(generated).astype("float32")
-    mask_arr = mask_arr[..., None]
+    # Bring only the generated layer and its feathered mask back to the source
+    # size; blend them over the original-resolution photo rather than a
+    # low-resolution copy of it.
+    generated_full = generated.resize(source.size, PILImage.LANCZOS)
+    source_arr = np.asarray(source).astype("float32")
+    generated_arr = np.asarray(generated_full).astype("float32")
+    mask_arr = (np.asarray(mask_full).astype("float32") / 255.0)[..., None]
     blended = (source_arr * (1.0 - mask_arr) + generated_arr * mask_arr).round().clip(0, 255).astype("uint8")
-    result = PILImage.fromarray(blended).resize(source.size, PILImage.BILINEAR)
-    return result
+    return PILImage.fromarray(blended)
 
 
 def _get_model_sample_size(unet):
@@ -705,6 +742,28 @@ def _normalize_noise_tensor(noise):
     mean = noise.mean(dim=dims, keepdim=True)
     std = noise.std(dim=dims, keepdim=True).clamp_min(1e-6)
     return (noise - mean) / std
+
+
+def _slerp_noise(start, end, amount):
+    """Spherically interpolate diffusion noise without shrinking its variance."""
+    import torch
+
+    amount = max(0.0, min(1.0, float(amount)))
+    start_flat = start.reshape(start.shape[0], -1)
+    end_flat = end.reshape(end.shape[0], -1)
+    start_unit = torch.nn.functional.normalize(start_flat, dim=1)
+    end_unit = torch.nn.functional.normalize(end_flat, dim=1)
+    dot = (start_unit * end_unit).sum(dim=1, keepdim=True).clamp(-0.9995, 0.9995)
+    omega = torch.acos(dot)
+    sin_omega = torch.sin(omega)
+    linear = (1.0 - amount) * start_flat + amount * end_flat
+    spherical = (
+        torch.sin((1.0 - amount) * omega) / sin_omega * start_flat
+        + torch.sin(amount * omega) / sin_omega * end_flat
+    )
+    use_linear = sin_omega.abs() < 1e-5
+    result = torch.where(use_linear, linear, spherical).reshape_as(start)
+    return _normalize_noise_tensor(result)
 
 
 def _pil_to_model_tensor(image, size, device, dtype):
@@ -733,7 +792,7 @@ def _model_tensor_to_pil(image_tensor):
     return PILImage.fromarray(image)
 
 
-def _sample_with_pipeline_from_noise(pipeline, initial_noise, num_inference_steps=50):
+def _sample_with_pipeline_from_noise(pipeline, initial_noise, num_inference_steps=50, generator=None):
     import torch
 
     # This custom sampler bypasses DDPMPipeline.__call__, so explicitly disable
@@ -745,7 +804,7 @@ def _sample_with_pipeline_from_noise(pipeline, initial_noise, num_inference_step
         scheduler.set_timesteps(int(num_inference_steps))
         for t in scheduler.timesteps:
             model_output = pipeline.unet(image, t).sample
-            image = scheduler.step(model_output, t, image).prev_sample
+            image = scheduler.step(model_output, t, image, generator=generator).prev_sample
         return image.detach()
 
 
@@ -840,6 +899,8 @@ def generate_video_frames(
     reference_influence=0.6,
     reference_mode="Dreamify/Reconstruct",
     source_preservation=0.55,
+    motion_mode="Auto Cycle (Noise Drift)",
+    dream_transition_frames=24,
     progress_callback=None,
 ):
     import torch
@@ -856,9 +917,21 @@ def generate_video_frames(
     current_noise = torch.randn((1, 3, sample_h, sample_w), generator=generator, device=device, dtype=dtype)
     current_noise = _normalize_noise_tensor(current_noise)
 
+    dream_mode = str(motion_mode).lower().startswith("dream cycle")
+    dream_transition_frames = max(2, int(dream_transition_frames))
+    dream_start = current_noise
+    dream_target = _normalize_noise_tensor(
+        torch.randn(current_noise.shape, generator=generator, device=device, dtype=dtype)
+    )
+
     # High smoothness = slower drift in latent space, lower smoothness = more change per frame.
     smoothness = max(1, min(100, int(smoothness)))
     drift_alpha = max(0.03, 1.0 - (smoothness / 100.0) * 0.95)
+    # DDPM noise space is not as semantically smooth as a GAN latent space.
+    # Ease decoded Dream Cycle frames toward each new result, but never feed a
+    # decoded frame back through diffusion: repeated reconstruction compounds
+    # artifacts and eventually collapses the sequence into abstraction.
+    temporal_morph_amount = max(0.08, 0.38 - (smoothness / 100.0) * 0.30)
 
     reference_frames = None
     if reference_video_path:
@@ -868,7 +941,17 @@ def generate_video_frames(
 
     frames = []
     for frame_index in range(total_frames):
-        if frame_index > 0:
+        if dream_mode:
+            segment_position = frame_index % dream_transition_frames
+            if frame_index > 0 and segment_position == 0:
+                dream_start = dream_target
+                dream_target = _normalize_noise_tensor(
+                    torch.randn(current_noise.shape, generator=generator, device=device, dtype=dtype)
+                )
+            current_noise = _slerp_noise(
+                dream_start, dream_target, segment_position / float(dream_transition_frames)
+            )
+        elif frame_index > 0:
             fresh_noise = torch.randn(current_noise.shape, generator=generator, device=device, dtype=dtype)
             current_noise = _normalize_noise_tensor((1.0 - drift_alpha) * current_noise + drift_alpha * fresh_noise)
 
@@ -905,10 +988,100 @@ def generate_video_frames(
                 from PIL import Image as PILImage
                 frame_image = PILImage.blend(ref_resized, frame_image.convert("RGB"), dream_amount)
 
+        if dream_mode and frames:
+            from PIL import Image as PILImage
+
+            previous_frame = frames[-1].convert("RGB")
+            if previous_frame.size != frame_image.size:
+                previous_frame = previous_frame.resize(frame_image.size, PILImage.BILINEAR)
+            frame_image = PILImage.blend(
+                previous_frame, frame_image.convert("RGB"), temporal_morph_amount
+            )
+
         frames.append(frame_image)
 
         if progress_callback is not None:
             progress_callback(frame_index + 1, total_frames, frame_image)
+
+    return frames
+
+
+@synchronized_inference
+def generate_dream_cycle_frames(
+    model_path_or_name: str,
+    frame_count=48,
+    seed=None,
+    num_inference_steps=40,
+    variation_strength=0.12,
+    transition_frames=24,
+    interpolation_curve="Cosine Ease",
+    sampler="DDIM",
+    progress_callback=None,
+):
+    """Render a deterministic, local walk through DDPM input-noise space.
+
+    Unlike the regular Video tab, this deliberately uses DDIM so nearby noise
+    inputs map deterministically to nearby outputs. Each target is only a small
+    perturbation of the previous target; independent Gaussian endpoints are
+    far enough apart to make a DDPM appear to cut between unrelated images.
+    """
+    import math
+    import torch
+
+    pipeline = load_pipeline(model_path_or_name)
+    sampler = str(sampler or "DDIM").upper()
+    if sampler not in {"DDIM", "DDPM"}:
+        raise ValueError(f"Unsupported Dream Cycler sampler: {sampler}")
+    pipeline = apply_sampler_to_pipeline(pipeline, sampler=sampler)
+    device = next(pipeline.unet.parameters()).device
+    dtype = next(pipeline.unet.parameters()).dtype
+    sample_w, sample_h = _get_model_sample_size(pipeline.unet)
+
+    frame_count = max(1, int(frame_count))
+    transition_frames = max(2, int(transition_frames))
+    variation_strength = max(0.005, min(1.0, float(variation_strength)))
+    base_seed = int(seed) if seed is not None else random.randint(0, 2_147_483_647)
+    generator = torch.Generator(device=device).manual_seed(base_seed)
+
+    shape = (1, 3, sample_h, sample_w)
+    waypoint_start = _normalize_noise_tensor(
+        torch.randn(shape, generator=generator, device=device, dtype=dtype)
+    )
+
+    def nearby_target(origin):
+        perturbation = torch.randn(shape, generator=generator, device=device, dtype=dtype)
+        return _normalize_noise_tensor(origin + variation_strength * perturbation)
+
+    waypoint_target = nearby_target(waypoint_start)
+    frames = []
+    for frame_index in range(frame_count):
+        position = frame_index % transition_frames
+        if frame_index > 0 and position == 0:
+            waypoint_start = waypoint_target
+            waypoint_target = nearby_target(waypoint_start)
+
+        progress = position / float(transition_frames)
+        if str(interpolation_curve).lower().startswith("linear"):
+            amount = progress
+        else:
+            # Cosine easing removes the small velocity jump when a new local
+            # target is chosen and creates slow-in/slow-out motion.
+            amount = 0.5 - 0.5 * math.cos(math.pi * progress)
+        noise = _normalize_noise_tensor(
+            (1.0 - amount) * waypoint_start + amount * waypoint_target
+        )
+        # DDPM adds random variance during denoising. Resetting this generator
+        # for every frame gives every nearby input the same variance pattern,
+        # preserving temporal continuity while retaining the DDPM sampler.
+        denoise_generator = torch.Generator(device=device).manual_seed(base_seed + 1_000_003)
+        frame_tensor = _sample_with_pipeline_from_noise(
+            pipeline, noise, num_inference_steps=num_inference_steps,
+            generator=denoise_generator,
+        )
+        frame_image = _model_tensor_to_pil(frame_tensor)
+        frames.append(frame_image)
+        if progress_callback is not None:
+            progress_callback(frame_index + 1, frame_count, frame_image)
 
     return frames
 
@@ -1127,15 +1300,15 @@ def parse_progress_line(line: str):
     than starting a fresh line. We therefore search for the prefix
     anywhere in the line instead of requiring it at the start.
     """
-    prefix = "PROGRESS_JSON:"
-    idx = line.find(prefix)
-    if idx == -1:
-        return None
-    payload = line[idx + len(prefix):].strip()
-    try:
-        return json.loads(payload)
-    except json.JSONDecodeError:
-        return None
+    for prefix in ("PROGRESS_JSON:", "AUDIO_PROGRESS_JSON:"):
+        idx = line.find(prefix)
+        if idx == -1:
+            continue
+        try:
+            return json.loads(line[idx + len(prefix):].strip())
+        except json.JSONDecodeError:
+            return None
+    return None
 
 
 CUDA_CPU_WARNING_MESSAGE = (
@@ -2509,6 +2682,238 @@ class TrainTab(ttk.Frame):
 
 
 # ----------------------------------------------------------------------------
+# Sound tab -- intentionally a waveform reconstruction baseline. This is the
+# fastest honest way to prove audio loading, clipping, GPU training and WAV
+# output before adding a much less reliable generative audio diffusion stage.
+# ----------------------------------------------------------------------------
+class SoundTab(ttk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, style="Panel.TFrame")
+        self.app = app
+        self.proc = None
+        self.events = queue.Queue()
+        self.active = False
+        self.mode = None
+        self.stop_file = None
+        self.preview_path = None
+        self.source_paths = []
+        self._build_ui()
+        self.after(100, self._poll)
+
+    def _build_ui(self):
+        self.columnconfigure(0, weight=1)
+        header = ttk.Label(self, text="Short Sounds & Textures", style="Heading.TLabel")
+        header.grid(row=0, column=0, sticky="w", padx=16, pady=(16, 4))
+        ttk.Label(self, text="Reconstruction test: train on one or more WAV or MP3 files, split them into short overlapping clips, then listen to a reconstructed clip. MP3s are decoded to temporary WAVs and never modify the originals.", style="Meta.TLabel", wraplength=850).grid(row=1, column=0, sticky="w", padx=16, pady=(0, 12))
+
+        card = ttk.Frame(self, style="Card.TFrame")
+        card.grid(row=2, column=0, sticky="ew", padx=16, pady=4)
+        card.columnconfigure(1, weight=1)
+        self.source_var = tk.StringVar()
+        self.output_var = tk.StringVar(value=str(ROOT_DIR / "output" / "sound_models" / "Sound Test"))
+        self.epochs = LabeledEntry(card, "Epochs", default=300, tooltip="For a single-file overfit test, 300 is a reasonable first attempt. Increase if the preview is still noise.")
+        self.clip_seconds = LabeledEntry(card, "Clip length (seconds)", default="1.0", tooltip="How long each training clip is. Start at 1 second. Shorter clips are easier; longer clips preserve more of a sound or phrase but need more memory and training.")
+        self.sample_rate = LabeledCombo(card, "Training rate", values=["8000", "16000"], default="8000", tooltip="8 kHz is the lightweight test setting. 16 kHz retains more brightness but needs more VRAM and time.")
+        self.batch_size = LabeledEntry(card, "Batch size", default=8, tooltip="Lower this to 2 or 4 if you run out of VRAM.")
+        for row, label, var, browse in [(0, "Source audio clips", self.source_var, self._browse_source), (1, "Save model to", self.output_var, self._browse_output)]:
+            ttk.Label(card, text=label, style="Field.TLabel").grid(row=row, column=0, sticky="w", padx=10, pady=7)
+            ttk.Entry(card, textvariable=var, style="Field.TEntry").grid(row=row, column=1, sticky="ew", padx=6, pady=7)
+            ttk.Button(card, text="Browse...", command=browse, style="Secondary.TButton").grid(row=row, column=2, padx=10, pady=7)
+        ttk.Button(card, text="Browse folder...", command=self._browse_source_folder, style="Secondary.TButton").grid(row=0, column=3, padx=(0, 10), pady=7)
+        self.epochs.grid(row=2, column=0, sticky="ew", padx=10, pady=8)
+        self.clip_seconds.grid(row=2, column=1, sticky="ew", padx=6, pady=8)
+        self.sample_rate.grid(row=2, column=2, sticky="ew", padx=10, pady=8)
+        self.batch_size.grid(row=2, column=3, sticky="ew", padx=10, pady=8)
+        self.overlap_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(card, text="50% clip overlap (recommended for one file)", variable=self.overlap_var, style="Dark.TCheckbutton").grid(row=3, column=0, columnspan=4, sticky="w", padx=10, pady=(0, 10))
+
+        generation = ttk.Frame(self, style="Card.TFrame")
+        generation.grid(row=3, column=0, sticky="ew", padx=16, pady=(8, 4))
+        for column in range(4):
+            generation.columnconfigure(column, weight=1)
+        ttk.Label(generation, text="Generation Mode", style="Status.TLabel").grid(row=0, column=0, columnspan=4, sticky="w", padx=10, pady=(10, 4))
+        self.generation_duration = LabeledEntry(generation, "Output length (seconds)", default="2.0", tooltip="Generated WAV length. Longer outputs join several learned blends with short crossfades.")
+        self.blend_count = LabeledCombo(generation, "Clips blended", values=["2", "3", "4", "5", "7"], default="3", tooltip="How many learned training clips influence each generated section.")
+        self.generation_variation = LabeledEntry(generation, "Variation", default="0.05", tooltip="Adds a small amount of noise in learned space. Use 0 for a clean blend; 0.02-0.10 is experimental variation.")
+        self.generation_seed = LabeledEntry(generation, "Seed (0 = random)", default="0", tooltip="Use the same nonzero seed to reproduce a generated sound.")
+        self.generation_duration.grid(row=1, column=0, sticky="ew", padx=10, pady=(2, 10))
+        self.blend_count.grid(row=1, column=1, sticky="ew", padx=10, pady=(2, 10))
+        self.generation_variation.grid(row=1, column=2, sticky="ew", padx=10, pady=(2, 10))
+        self.generation_seed.grid(row=1, column=3, sticky="ew", padx=10, pady=(2, 10))
+
+        controls = ttk.Frame(self, style="Panel.TFrame")
+        controls.grid(row=4, column=0, sticky="w", padx=16, pady=12)
+        self.start_btn = ttk.Button(controls, text="Train Reconstruction Test", command=self._start, style="Accent.TButton")
+        self.start_btn.pack(side="left")
+        self.stop_btn = ttk.Button(controls, text="Stop", command=self._stop, style="Secondary.TButton", state=tk.DISABLED)
+        self.stop_btn.pack(side="left", padx=8)
+        self.generate_btn = ttk.Button(controls, text="Generate New Sound", command=self._generate, style="Accent.TButton")
+        self.generate_btn.pack(side="left", padx=(0, 8))
+        self.play_btn = ttk.Button(controls, text="Open Last WAV", command=self._open_preview, style="Secondary.TButton", state=tk.DISABLED)
+        self.play_btn.pack(side="left")
+
+        panel = ttk.Frame(self, style="Card.TFrame")
+        panel.grid(row=5, column=0, sticky="nsew", padx=16, pady=(0, 16))
+        self.status = ttk.Label(panel, text="Choose one or more WAV or MP3 files, then start the test.", style="Status.TLabel")
+        self.status.pack(anchor="w", padx=12, pady=(12, 4))
+        self.progress = ttk.Progressbar(panel, orient="horizontal", mode="determinate")
+        self.progress.pack(fill="x", padx=12, pady=4)
+        self.details = ttk.Label(panel, text="", style="Meta.TLabel")
+        self.details.pack(anchor="w", padx=12, pady=(2, 10))
+        self.log = tk.Text(panel, height=12, bg=BG_FIELD, fg=FG_DIM, insertbackground=FG, relief="flat", font=("Consolas", 9), wrap="word")
+        self.log.pack(fill="both", expand=True, padx=12, pady=(0, 12)); self.log.config(state=tk.DISABLED)
+
+    def _browse_source(self):
+        paths = filedialog.askopenfilenames(title="Choose one or more audio files", filetypes=[("Audio files", "*.wav *.mp3"), ("WAV audio", "*.wav"), ("MP3 audio", "*.mp3"), ("All files", "*.*")])
+        if paths:
+            self.source_paths = [str(Path(path)) for path in paths]
+            first = Path(paths[0]).name
+            self.source_var.set(first if len(paths) == 1 else f"{len(paths)} audio files selected (first: {first})")
+
+    def _browse_source_folder(self):
+        folder = filedialog.askdirectory(title="Choose a folder of WAV or MP3 clips")
+        if not folder:
+            return
+        root = Path(folder)
+        extensions = {".wav", ".mp3"}
+        paths = sorted(path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in extensions)
+        if not paths:
+            messagebox.showerror("No audio clips found", "That folder (including its subfolders) contains no WAV or MP3 files.")
+            return
+        self.source_paths = [str(path) for path in paths]
+        self.source_var.set(f"{len(paths)} audio clips from folder: {root.name}")
+
+    def _browse_output(self):
+        path = filedialog.askdirectory(title="Choose sound model folder")
+        if path:
+            self.output_var.set(path)
+
+    def _append(self, message):
+        self.log.config(state=tk.NORMAL); self.log.insert(tk.END, message + "\n"); self.log.see(tk.END); self.log.config(state=tk.DISABLED)
+
+    def _start(self):
+        sources = [Path(path).expanduser() for path in self.source_paths]
+        supported_extensions = {".wav", ".mp3"}
+        if not sources or any(not path.exists() or path.suffix.lower() not in supported_extensions for path in sources):
+            messagebox.showerror("Choose audio files", "Choose one or more WAV or MP3 files. MP3 files are safely converted to temporary WAVs while training.")
+            return
+        try:
+            epochs, batch, clip_seconds = int(self.epochs.get()), int(self.batch_size.get()), float(self.clip_seconds.get())
+            if epochs < 1 or batch < 1 or clip_seconds < 0.1 or clip_seconds > 10: raise ValueError
+        except ValueError:
+            messagebox.showerror("Check settings", "Epochs and batch size must be positive whole numbers. Clip length must be between 0.1 and 10 seconds."); return
+        out = Path(self.output_var.get()).expanduser(); out.mkdir(parents=True, exist_ok=True)
+        self.stop_file = out / "gui_stop_sound_training.flag"
+        try: self.stop_file.unlink()
+        except FileNotFoundError: pass
+        # A large selection can exceed Windows' command-line limit if every
+        # filename is passed as an argument.  Hand the trainer one UTF-8 list
+        # file instead, which also preserves paths with spaces safely.
+        inputs_file = out / "sound_training_inputs.txt"
+        inputs_file.write_text("\n".join(str(path.resolve()) for path in sources) + "\n", encoding="utf-8")
+        cmd = [sys.executable, str(AUDIO_TRAIN_SCRIPT), "--inputs_file", str(inputs_file), "--output_dir", str(out), "--epochs", str(epochs), "--batch_size", str(batch), "--clip_seconds", str(clip_seconds), "--sample_rate", self.sample_rate.get(), "--overlap", "0.5" if self.overlap_var.get() else "0.0", "--stop_signal_file", str(self.stop_file)]
+        self.mode = "train"
+        self.active = True; self.start_btn.config(state=tk.DISABLED); self.generate_btn.config(state=tk.DISABLED); self.stop_btn.config(state=tk.NORMAL); self.play_btn.config(state=tk.DISABLED)
+        self.app.set_sound_training_active(True)
+        self.progress.config(value=0, maximum=epochs); self.status.config(text="Preparing audio clips..."); self.details.config(text="")
+        self._append("Starting waveform reconstruction test. It is normal for early previews to be rough.")
+        try:
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, cwd=str(ROOT_DIR))
+        except OSError as exc:
+            self._finish(False); messagebox.showerror("Couldn't start sound training", str(exc)); return
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _generate(self):
+        model_dir = Path(self.output_var.get()).expanduser()
+        checkpoint = model_dir / "sound_reconstruction.pt"
+        if not checkpoint.exists():
+            messagebox.showerror("Train a sound model first", "No sound_reconstruction.pt was found in the selected model folder.")
+            return
+        try:
+            duration = float(self.generation_duration.get())
+            variation = float(self.generation_variation.get())
+            seed = int(self.generation_seed.get())
+            blend_count = int(self.blend_count.get())
+            if duration < 0.1 or duration > 60 or variation < 0 or variation > 0.5:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Check generation settings", "Output length must be 0.1-60 seconds, variation 0-0.5, and seed a whole number.")
+            return
+        cmd = [
+            sys.executable, str(AUDIO_GENERATE_SCRIPT),
+            "--model_dir", str(model_dir), "--duration", str(duration),
+            "--blend_count", str(blend_count), "--variation", str(variation), "--seed", str(seed),
+        ]
+        self.mode = "generate"
+        self.active = True
+        self.start_btn.config(state=tk.DISABLED)
+        self.generate_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.DISABLED)
+        self.app.set_sound_training_active(True)
+        self.status.config(text="Blending learned audio patterns...")
+        self.progress.config(value=0, maximum=1)
+        try:
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, cwd=str(ROOT_DIR))
+        except OSError as exc:
+            self._finish(False)
+            messagebox.showerror("Couldn't start generation", str(exc))
+            return
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        for line in self.proc.stdout:
+            evt = parse_progress_line(line)
+            self.events.put(("event", evt) if evt else ("log", line.strip()))
+        self.events.put(("exit", self.proc.wait()))
+
+    def _poll(self):
+        try:
+            while True:
+                kind, data = self.events.get_nowait()
+                if kind == "log" and data: self._append(data)
+                elif kind == "exit":
+                    if self.active: self._finish(data == 0)
+                elif data:
+                    event = data.get("event")
+                    if event == "dataset_ready":
+                        self.status.config(text="Training reconstruction model...")
+                        self.details.config(text=f"{data['clips']} overlapping clip(s) • {data['sample_rate']} Hz • source: {data['original_seconds']} seconds")
+                        self._append("Dataset ready: " + self.details.cget("text"))
+                    elif event == "epoch":
+                        self.progress.config(value=data["epoch"], maximum=data["total_epochs"])
+                        self.status.config(text=f"Training epoch {data['epoch']} / {data['total_epochs']}")
+                        self.details.config(text=f"Loss {data['loss']:.5f} • {format_eta(data.get('eta_seconds'))}")
+                    elif event == "done":
+                        self.preview_path = data.get("preview_path"); self.status.config(text="Done. Open the preview WAV and listen for recognizable audio.")
+                        self.play_btn.config(state=tk.NORMAL); self._append("Preview saved: " + str(self.preview_path))
+                    elif event == "generation_step":
+                        self.progress.config(value=data.get("step", 0), maximum=max(1, data.get("total_steps", 1)))
+                        self.status.config(text=f"Generating section {data.get('step', 0)} / {data.get('total_steps', 1)}...")
+                    elif event == "generated":
+                        self.preview_path = data.get("preview_path")
+                        self.status.config(text=f"Generated {data.get('duration', '?')} second sound with seed {data.get('seed', '?')}.")
+                        self.details.config(text="Blended learned representations from multiple training clips.")
+                        self.play_btn.config(state=tk.NORMAL)
+                        self._append("Generated WAV: " + str(self.preview_path))
+        except queue.Empty: pass
+        self.after(100, self._poll)
+
+    def _stop(self):
+        if self.active and self.stop_file:
+            self.stop_file.write_text("stop", encoding="utf-8"); self.stop_btn.config(state=tk.DISABLED); self.status.config(text="Stop requested; finishing the current epoch...")
+
+    def _finish(self, success):
+        self.active = False; self.mode = None; self.start_btn.config(state=tk.NORMAL); self.generate_btn.config(state=tk.NORMAL); self.stop_btn.config(state=tk.DISABLED)
+        self.app.set_sound_training_active(False)
+        if not success and not self.preview_path: self.status.config(text="Sound training stopped or failed. See the log below.")
+
+    def _open_preview(self):
+        if self.preview_path and Path(self.preview_path).exists():
+            try: os.startfile(self.preview_path)
+            except Exception as exc: messagebox.showerror("Couldn't open preview", str(exc))
+
+
+# ----------------------------------------------------------------------------
 # Generate tab
 # ----------------------------------------------------------------------------
 class GenerateTab(ttk.Frame):
@@ -2907,6 +3312,8 @@ class GenerateTab(ttk.Frame):
         self.refresh_checkpoints()
         if hasattr(self.app, "video_tab"):
             self.app.video_tab.refresh_models()
+        if hasattr(self.app, "dream_cycle_tab"):
+            self.app.dream_cycle_tab.refresh_models()
         if hasattr(self.app, "canvas_tab"):
             self.app.canvas_tab.refresh_models()
         imported = result.get("imported", [])
@@ -3168,13 +3575,16 @@ class CanvasTab(ttk.Frame):
         self.brush_size.pack(fill="x", padx=12, pady=6)
         self.mask_softness = LabeledScale(controls, "Mask softness", from_=0, to=40, default=12)
         self.mask_softness.pack(fill="x", padx=12, pady=6)
+        self.mask_softness.var.trace_add(
+            "write", lambda *_args: self._redraw_canvas() if self.source_image else None
+        )
         self.reference_intensity = LabeledScale(
             controls,
             "Reference intensity",
             from_=0,
             to=100,
             default=65,
-            tooltip="Higher values preserve more of the loaded image structure before blending the masked dream region.",
+            tooltip="Keep this around 60–85 for an edit that still belongs in the photo. 0 generates unrelated random content, which is useful only for a full repaint.",
         )
         self.reference_intensity.pack(fill="x", padx=12, pady=6)
         self.canvas_steps = LabeledScale(controls, "Steps", from_=10, to=200, default=75)
@@ -3275,12 +3685,19 @@ class CanvasTab(ttk.Frame):
         self._redraw_canvas()
 
     def _compose_canvas_preview(self):
-        from PIL import Image as PILImage
+        from PIL import Image as PILImage, ImageFilter
         base = (self.result_image or self.source_image).convert("RGB")
         if self.mask_image is None:
             return base
         overlay = PILImage.new("RGBA", base.size, (255, 70, 70, 0))
-        alpha = self.mask_image.point(lambda p: int(p * 0.35))
+        # Preview the exact feathering the user selected, so the red boundary
+        # is an honest preview of the blend edge rather than only a hard brush
+        # outline.  A value of zero intentionally remains hard-edged.
+        preview_mask = self.mask_image
+        softness = max(0, int(self.mask_softness.get()))
+        if softness:
+            preview_mask = preview_mask.filter(ImageFilter.GaussianBlur(radius=softness))
+        alpha = preview_mask.point(lambda p: int(p * 0.35))
         overlay.putalpha(alpha)
         return PILImage.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
 
@@ -3483,7 +3900,7 @@ class VideoTab(ttk.Frame):
 
         self.video_smoothness = LabeledScale(
             controls, "Motion smoothness", from_=1, to=100, default=85,
-            tooltip="Higher values keep frames closer together in latent space for a smoother dream walk."
+            tooltip="Higher values reduce the random noise drift between ordinary video keyframes. Use the Dream Cycler tab for GAN-style latent motion."
         )
         self.video_smoothness.pack(fill="x", padx=12, pady=6)
 
@@ -3541,7 +3958,7 @@ class VideoTab(ttk.Frame):
         self.video_preview_label.grid(row=2, column=0, sticky="nsew", padx=14, pady=(0, 8))
         self.video_info_label = ttk.Label(
             preview,
-            text="Uses DDPM keyframes plus blended in-between frames. Output FPS changes smoothness; DDPM keyframes/sec controls how many real diffusion frames are sampled.",
+            text="The Video tab makes standalone or reference-guided DDPM videos. For subtle GANField-style latent transformations, use the separate Dream Cycler tab.",
             style="Meta.TLabel", wraplength=520, justify="left",
         )
         self.video_info_label.grid(row=3, column=0, sticky="w", padx=14, pady=(0, 14))
@@ -3666,6 +4083,8 @@ class VideoTab(ttk.Frame):
             "reference_influence": ref_influence / 100.0,
             "reference_mode": reference_mode,
             "source_preservation": source_preservation / 100.0,
+            "motion_mode": "Auto Cycle (Noise Drift)",
+            "dream_transition_frames": 24,
             "seed": seed,
             "output_path": out_path,
             "total_frames": total_frames,
@@ -3709,6 +4128,8 @@ class VideoTab(ttk.Frame):
                     reference_influence=settings["reference_influence"],
                     reference_mode=settings["reference_mode"],
                     source_preservation=settings["source_preservation"],
+                    motion_mode=settings["motion_mode"],
+                    dream_transition_frames=settings["dream_transition_frames"],
                     progress_callback=progress_callback,
                 )
                 output_frames = interpolate_video_frames(frames, settings["output_frames"])
@@ -3720,7 +4141,7 @@ class VideoTab(ttk.Frame):
                     self.video_progress.config(value=settings["total_frames"], maximum=settings["total_frames"])
                     self.video_status_label.config(text=f"Done. Saved video to: {saved_path}")
                     self.video_info_label.config(text=(
-                        f"Rendered {len(frames)} DDPM keyframe(s), interpolated to {settings['output_frames']} output frame(s) at {settings['fps']} FPS using {settings['reference_mode']} mode. "
+                        f"Rendered {len(frames)} DDPM keyframe(s) with {settings['motion_mode']}, interpolated to {settings['output_frames']} output frame(s) at {settings['fps']} FPS using {settings['reference_mode']} mode. "
                         f"If MP4 export wasn't available, the app automatically fell back to GIF."
                     ))
                 self.after(0, finish)
@@ -3730,6 +4151,257 @@ class VideoTab(ttk.Frame):
                     self.generate_video_btn.config(state=tk.NORMAL)
                     self.video_status_label.config(text=f"Error: {error_text}")
                     self.video_info_label.config(text="Video generation failed. If this happened during MP4 export, try GIF output first.")
+                self.after(0, fail)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
+# ----------------------------------------------------------------------------
+# Dream Cycler tab -- deterministic local DDPM latent walk
+# ----------------------------------------------------------------------------
+class DreamCycleTab(ttk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, style="Panel.TFrame")
+        self.app = app
+        self.preview_photo_ref = None
+        self.last_video_path = None
+        self._model_paths_by_label = {}
+        self._build_ui()
+        self.refresh_models()
+
+    def _build_ui(self):
+        self.columnconfigure(0, weight=0)
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        ttk.Label(self, text="DDPM Dream Cycler", style="Heading.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=16, pady=(16, 8)
+        )
+        controls = ttk.Frame(self, style="Card.TFrame")
+        controls.grid(row=1, column=0, sticky="ns", padx=(16, 10), pady=(0, 16))
+        preview = ttk.Frame(self, style="Card.TFrame")
+        preview.grid(row=1, column=1, sticky="nsew", padx=(0, 16), pady=(0, 16))
+        preview.columnconfigure(0, weight=1)
+        preview.rowconfigure(2, weight=1)
+
+        ttk.Label(controls, text="GAN-style Local Latent Walk", style="Meta.TLabel").pack(
+            anchor="w", padx=12, pady=(12, 8)
+        )
+        model_wrap = ttk.Frame(controls, style="Card.TFrame")
+        model_wrap.pack(fill="x", padx=12, pady=6)
+        ttk.Label(model_wrap, text="Model", style="Meta.TLabel").pack(anchor="w")
+        self.model_var = tk.StringVar()
+        self.model_combo = ttk.Combobox(
+            model_wrap, textvariable=self.model_var, state="readonly", width=28
+        )
+        self.model_combo.pack(fill="x", pady=(2, 4))
+        model_buttons = ttk.Frame(model_wrap, style="Card.TFrame")
+        model_buttons.pack(fill="x")
+        ttk.Button(model_buttons, text="Refresh", command=self.refresh_models, style="Secondary.TButton").pack(side="left")
+        ttk.Button(model_buttons, text="Use Generate Selection", command=self._use_generate_model, style="Secondary.TButton").pack(side="left", padx=(6, 0))
+
+        timing = ttk.Frame(controls, style="Card.TFrame")
+        timing.pack(fill="x", padx=12, pady=6)
+        ttk.Label(timing, text="Length / timing", style="Meta.TLabel").pack(anchor="w")
+        row = ttk.Frame(timing, style="Card.TFrame")
+        row.pack(fill="x", pady=(2, 0))
+        self.seconds_var = tk.StringVar(value="6")
+        self.keyframe_fps_var = tk.StringVar(value="6")
+        self.output_fps_var = tk.StringVar(value="24")
+        for column, (label, variable) in enumerate((
+            ("Seconds", self.seconds_var),
+            ("Dream frames/sec", self.keyframe_fps_var),
+            ("Output FPS", self.output_fps_var),
+        )):
+            ttk.Label(row, text=label, style="Meta.TLabel").grid(row=0, column=column, sticky="w")
+            ttk.Entry(row, textvariable=variable, width=9, style="Field.TEntry").grid(
+                row=1, column=column, sticky="w", padx=(0, 8) if column < 2 else 0
+            )
+
+        self.sampler = LabeledCombo(
+            controls, "Sampler", values=["DDIM", "DDPM"], default="DDIM", width=12,
+            tooltip="DDIM is naturally deterministic and usually smoother. DDPM uses a fixed denoising-randomness pattern across frames to preserve continuity."
+        )
+        self.sampler.pack(fill="x", padx=12, pady=6)
+        self.interpolation_curve = LabeledCombo(
+            controls, "Movement curve", values=["Cosine Ease", "Linear"], default="Cosine Ease", width=16,
+            tooltip="Linear moves at a constant rate. Cosine Ease slows near each waypoint and accelerates through the middle."
+        )
+        self.interpolation_curve.pack(fill="x", padx=12, pady=6)
+
+        self.steps = LabeledScale(
+            controls, "Inference steps", from_=10, to=120, default=40,
+            tooltip="More steps may improve detail but make every dream frame take longer."
+        )
+        self.steps.pack(fill="x", padx=12, pady=6)
+        self.variation = LabeledScale(
+            controls, "Variation per waypoint", from_=1, to=60, default=10,
+            tooltip="How far each new latent target moves. Start around 6-12 for the subtle GANField-style drift."
+        )
+        self.variation.pack(fill="x", padx=12, pady=6)
+        self.transition_frames = LabeledScale(
+            controls, "Frames per transition", from_=4, to=120, default=30,
+            tooltip="How many real dream frames it takes to reach each nearby latent target."
+        )
+        self.transition_frames.pack(fill="x", padx=12, pady=6)
+
+        seed_wrap = ttk.Frame(controls, style="Card.TFrame")
+        seed_wrap.pack(fill="x", padx=12, pady=6)
+        ttk.Label(seed_wrap, text="Seed (optional)", style="Meta.TLabel").pack(anchor="w")
+        self.seed_var = tk.StringVar(value="")
+        ttk.Entry(seed_wrap, textvariable=self.seed_var, style="Field.TEntry").pack(fill="x", pady=(2, 4))
+        ttk.Button(seed_wrap, text="Randomize Seed", command=lambda: self.seed_var.set(str(random.randint(0, 2_147_483_647))), style="Secondary.TButton").pack(anchor="w")
+
+        output_wrap = ttk.Frame(controls, style="Card.TFrame")
+        output_wrap.pack(fill="x", padx=12, pady=6)
+        ttk.Label(output_wrap, text="Output", style="Meta.TLabel").pack(anchor="w")
+        self.output_dir_var = tk.StringVar(value=str(ROOT_DIR / "output" / "dream_cycles"))
+        ttk.Entry(output_wrap, textvariable=self.output_dir_var, style="Field.TEntry").pack(fill="x", pady=(2, 4))
+        output_buttons = ttk.Frame(output_wrap, style="Card.TFrame")
+        output_buttons.pack(fill="x")
+        ttk.Button(output_buttons, text="Browse...", command=self._browse_output, style="Secondary.TButton").pack(side="left")
+        ttk.Label(output_buttons, text="Format", style="Meta.TLabel").pack(side="left", padx=(10, 6))
+        self.format_var = tk.StringVar(value="mp4")
+        ttk.Combobox(output_buttons, textvariable=self.format_var, values=["mp4", "gif"], state="readonly", width=6).pack(side="left")
+
+        self.generate_btn = ttk.Button(controls, text="Generate Dream Cycle", command=self._on_generate, style="Accent.TButton")
+        self.generate_btn.pack(fill="x", padx=12, pady=(12, 6))
+        ttk.Button(controls, text="Open Output Folder", command=self._open_output, style="Secondary.TButton").pack(fill="x", padx=12, pady=(0, 12))
+
+        self.status_label = ttk.Label(preview, text="Ready to render a local latent walk.", style="Status.TLabel")
+        self.status_label.grid(row=0, column=0, sticky="w", padx=14, pady=(12, 6))
+        self.progress = ttk.Progressbar(preview, orient="horizontal", mode="determinate")
+        self.progress.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 8))
+        self.preview_label = tk.Label(preview, text="Dream-cycle frame will appear here", bg=BG_FIELD, fg=FG_DIM, font=(FONT_FAMILY, 11))
+        self.preview_label.grid(row=2, column=0, sticky="nsew", padx=14, pady=(0, 8))
+        self.info_label = ttk.Label(
+            preview,
+            text="This is separate from Video: it moves a short distance between nearby noise-space waypoints with your chosen sampler and movement curve. It never feeds generated frames back into the model.",
+            style="Meta.TLabel", wraplength=520, justify="left"
+        )
+        self.info_label.grid(row=3, column=0, sticky="w", padx=14, pady=(0, 14))
+
+    def refresh_models(self):
+        self._model_paths_by_label = {}
+        labels = []
+        for _label, path, _mtime, info in find_checkpoints(DEFAULT_MODELS_ROOT):
+            label = f"{info['display']} ({info['resolution']})"
+            labels.append(label)
+            self._model_paths_by_label[label] = path
+        if not labels:
+            labels = ["Pretrained demo model (128x128)"]
+            self._model_paths_by_label[labels[0]] = PRETRAINED_MODEL
+        self.model_combo.config(values=labels)
+        if self.model_var.get() not in labels:
+            self.model_var.set(labels[0])
+
+    def _use_generate_model(self):
+        model_path = self.app.get_preferred_model_path()
+        if not model_path:
+            messagebox.showerror("No model selected", "Select or load a model in the Generate tab first.")
+            return
+        for label, path in self._model_paths_by_label.items():
+            if path == model_path:
+                self.model_var.set(label)
+                self.status_label.config(text=f"Using model from Generate tab: {label}")
+                return
+        resolved = find_loadable_model_inside(Path(model_path)) if model_path != PRETRAINED_MODEL else None
+        if resolved is not None:
+            info = get_model_info(resolved)
+            label = f"{info['display']} ({info['resolution']})"
+            self._model_paths_by_label[label] = str(resolved)
+            self.model_combo.config(values=list(self._model_paths_by_label.keys()))
+            self.model_var.set(label)
+
+    def _browse_output(self):
+        chosen = filedialog.askdirectory(initialdir=self.output_dir_var.get() or str(ROOT_DIR))
+        if chosen:
+            self.output_dir_var.set(chosen)
+
+    def _open_output(self):
+        path = Path(self.output_dir_var.get()).expanduser()
+        path.mkdir(parents=True, exist_ok=True)
+        open_folder(path)
+
+    def _settings(self):
+        try:
+            seconds = float(self.seconds_var.get())
+            keyframe_fps = float(self.keyframe_fps_var.get())
+            output_fps = int(self.output_fps_var.get())
+            seed_text = self.seed_var.get().strip()
+            seed = int(seed_text) if seed_text else None
+        except ValueError:
+            messagebox.showerror("Invalid settings", "Length, frame rates, and seed must be valid numbers.")
+            return None
+        if seconds <= 0 or keyframe_fps <= 0 or output_fps <= 0:
+            messagebox.showerror("Invalid settings", "Length and frame rates must be greater than zero.")
+            return None
+        frame_count = max(2, int(round(seconds * keyframe_fps)))
+        if frame_count > 240 and not messagebox.askyesno("Large render", f"This will generate {frame_count} diffusion frames. Continue?"):
+            return None
+        output_count = max(2, int(round(seconds * output_fps)))
+        output_dir = Path(self.output_dir_var.get()).expanduser()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        extension = self.format_var.get().strip().lower() or "mp4"
+        return {
+            "model_path": self._model_paths_by_label.get(self.model_var.get(), PRETRAINED_MODEL),
+            "frame_count": frame_count,
+            "output_count": output_count,
+            "output_fps": output_fps,
+            "seed": seed,
+            "steps": self.steps.get(),
+            "variation": self.variation.get() / 100.0,
+            "transition_frames": self.transition_frames.get(),
+            "sampler": self.sampler.get(),
+            "interpolation_curve": self.interpolation_curve.get(),
+            "output_path": output_dir / f"dream_cycle_{time.strftime('%Y%m%d_%H%M%S')}.{extension}",
+        }
+
+    def _on_generate(self):
+        settings = self._settings()
+        if settings is None:
+            return
+        self.generate_btn.config(state=tk.DISABLED)
+        self.progress.config(value=0, maximum=settings["frame_count"])
+        self.status_label.config(text=f"Generating dream frame 0/{settings['frame_count']}...")
+
+        def progress_callback(done, total, frame_image):
+            def update():
+                self.progress.config(value=done, maximum=total)
+                try:
+                    from PIL import ImageTk
+                    photo = ImageTk.PhotoImage(scale_for_display(frame_image, target_size=512))
+                    self.preview_photo_ref = photo
+                    self.preview_label.config(image=photo, text="")
+                except Exception:
+                    pass
+                self.status_label.config(text=f"Generating dream frame {done}/{total}...")
+            self.after(0, update)
+
+        def worker():
+            try:
+                frames = generate_dream_cycle_frames(
+                    settings["model_path"], frame_count=settings["frame_count"], seed=settings["seed"],
+                    num_inference_steps=settings["steps"], variation_strength=settings["variation"],
+                    transition_frames=settings["transition_frames"],
+                    interpolation_curve=settings["interpolation_curve"], sampler=settings["sampler"],
+                    progress_callback=progress_callback,
+                )
+                output_frames = interpolate_video_frames(frames, settings["output_count"])
+                saved_path = save_video_frames(output_frames, settings["output_path"], fps=settings["output_fps"])
+
+                def finish():
+                    self.last_video_path = saved_path
+                    self.generate_btn.config(state=tk.NORMAL)
+                    self.progress.config(value=settings["frame_count"])
+                    self.status_label.config(text=f"Done. Saved cycle to: {saved_path}")
+                    self.info_label.config(text=f"Rendered {len(frames)} local-walk frames with {settings['sampler']} and {settings['interpolation_curve']}, then interpolated them to {settings['output_count']} frames at {settings['output_fps']} FPS. Variation: {settings['variation']:.2f}.")
+                self.after(0, finish)
+            except Exception as exc:
+                error_text = str(exc)[:700]
+                def fail():
+                    self.generate_btn.config(state=tk.NORMAL)
+                    self.status_label.config(text=f"Error: {error_text}")
                 self.after(0, fail)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -3755,14 +4427,18 @@ class App:
         notebook.pack(fill="both", expand=True, padx=0, pady=0)
 
         self.train_tab = TrainTab(notebook, self)
+        self.sound_tab = SoundTab(notebook, self)
         self.generate_tab = GenerateTab(notebook, self)
         self.canvas_tab = CanvasTab(notebook, self)
         self.video_tab = VideoTab(notebook, self)
+        self.dream_cycle_tab = DreamCycleTab(notebook, self)
 
         notebook.add(self.train_tab, text="  Train  ")
+        notebook.add(self.sound_tab, text="  Sound  ")
         notebook.add(self.generate_tab, text="  Generate  ")
         notebook.add(self.canvas_tab, text="  Canvas  ")
         notebook.add(self.video_tab, text="  Video  ")
+        notebook.add(self.dream_cycle_tab, text="  Dream Cycler  ")
         self.notebook = notebook
 
         self._restore_tab_settings()
@@ -4043,6 +4719,8 @@ class App:
         GPU and the output directory, so it's safer to avoid sampling mid-save."""
         state = tk.DISABLED if active else tk.NORMAL
         self.generate_tab.generate_btn.config(state=state)
+        self.sound_tab.start_btn.config(state=state)
+        self.sound_tab.generate_btn.config(state=state)
         self.canvas_tab.reimagine_btn.config(state=state)
         self.video_tab.generate_video_btn.config(state=state)
         if active:
@@ -4054,10 +4732,23 @@ class App:
             self.canvas_tab.canvas_status_label.config(text="Load an image and paint where DDPM should dream.")
             self.video_tab.video_status_label.config(text="Ready. Generate a DDPM dream video.")
 
+    def set_sound_training_active(self, active: bool):
+        """Sound training uses the same GPU; keep image tasks from competing."""
+        state = tk.DISABLED if active else tk.NORMAL
+        self.train_tab.start_btn.config(state=state)
+        self.generate_tab.generate_btn.config(state=state)
+        self.canvas_tab.reimagine_btn.config(state=state)
+        self.video_tab.generate_video_btn.config(state=state)
+        if active:
+            self.generate_tab.gen_status_label.config(text="Sound training is running — Generate will unlock when it finishes.")
+        else:
+            self.generate_tab.gen_status_label.config(text="Ready.")
+
     def notify_training_complete(self):
         self.generate_tab.refresh_checkpoints()
         self.canvas_tab.refresh_models()
         self.video_tab.refresh_models()
+        self.dream_cycle_tab.refresh_models()
 
     def get_preferred_model_path(self):
         return self.generate_tab.last_model_path or self.generate_tab.get_selected_model_path()
